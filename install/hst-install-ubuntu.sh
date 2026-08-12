@@ -1351,7 +1351,7 @@ ln -s /var/log/hestia $HESTIA/log
 # Building directory tree and creating some blank files for Hestia
 mkdir -p $HESTIA/conf $HESTIA/ssl $HESTIA/data/ips \
 	$HESTIA/data/queue $HESTIA/data/users $HESTIA/data/firewall \
-	$HESTIA/data/sessions
+	$HESTIA/data/sessions $HESTIA/data/adapter-locks
 touch $HESTIA/data/queue/backup.pipe $HESTIA/data/queue/disk.pipe \
 	$HESTIA/data/queue/webstats.pipe $HESTIA/data/queue/restart.pipe \
 	$HESTIA/data/queue/traffic.pipe $HESTIA/data/queue/daily.pipe $HESTIA/log/system.log \
@@ -1360,6 +1360,12 @@ chmod 750 $HESTIA/conf $HESTIA/data/users $HESTIA/data/ips $HESTIA/log
 chmod -R 750 $HESTIA/data/queue
 chmod 660 /var/log/hestia/*
 chmod 770 $HESTIA/data/sessions
+# $HESTIA/data/adapter-locks holds per-user lock files for the PHP Command
+# Adapter (web/inc/adapter/LockManager.php) — deliberately separate from
+# $HESTIA/data/users, which stays root-only. Ownership is set to
+# hestiaweb:hestiaweb below, once the hestiaweb user exists, mirroring the
+# existing $HESTIA/data/sessions convention (see LOCK_PERMISSION_REVIEW.md).
+chmod 770 $HESTIA/data/adapter-locks
 
 # Generating Hestia configuration
 rm -f $HESTIA/conf/hestia.conf > /dev/null 2>&1
@@ -2484,6 +2490,7 @@ update-rc.d hestia defaults
 systemctl start hestia
 check_result $? "hestia start failed"
 chown hestiaweb:hestiaweb $HESTIA/data/sessions
+chown hestiaweb:hestiaweb $HESTIA/data/adapter-locks
 
 # Create backup folder and set correct permission
 mkdir -p /backup/

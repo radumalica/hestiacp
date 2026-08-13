@@ -139,11 +139,12 @@ final class DomainListTest {
 
 		// "domain.create" used to be the placeholder unregistered
 		// operation here, back when this test was written; it is now a
-		// real, registered, mutating operation (see DomainCreateTest.php),
-		// so "domain.delete" — explicitly NOT implemented anywhere in
-		// this codebase — takes over as the "genuinely unknown operation"
-		// case instead.
-		$result = $adapter->invoke("domain.delete", ["user" => "admin", "domain" => "example.com"]);
+		// real, registered, mutating operation (see DomainCreateTest.php).
+		// "domain.delete" took over as the placeholder next, and is now
+		// ALSO real (see DomainDeleteTest.php) — "domain.rename" —
+		// explicitly NOT implemented anywhere in this codebase — takes
+		// over as the "genuinely unknown operation" case instead.
+		$result = $adapter->invoke("domain.rename", ["user" => "admin", "domain" => "example.com"]);
 
 		assertEquals("adapter_error", $result->status, "status");
 		assertEquals("UNKNOWN_OPERATION", $result->adapterErrorCode, "adapterErrorCode");

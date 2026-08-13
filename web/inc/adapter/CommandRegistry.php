@@ -8,14 +8,16 @@ namespace Hestiacp\Adapter;
  * ARCHITECTURE_ADAPTER_DESIGN.md section 2.
  *
  * Deliberately minimal for this vertical slice: two read-only operations
- * ("domain.get", "domain.list") and one mutating operation
- * ("domain.create"), each hand-verified against the actual
- * bin/v-list-web-domain / bin/v-list-web-domains / bin/v-add-web-domain
- * source (not guessed, and not derived from any script's header comment —
+ * ("domain.get", "domain.list") and two mutating operations
+ * ("domain.create", "domain.delete"), each hand-verified against the
+ * actual bin/v-list-web-domain / bin/v-list-web-domains /
+ * bin/v-add-web-domain / bin/v-delete-web-domain source (not guessed, and
+ * not derived from any script's header comment —
  * ARCHITECTURE_ADAPTER_DESIGN.md section 2 explicitly distrusts header
  * comments after finding two that were stale/mismatched with actual
- * script behavior). See DOMAIN_CREATE_IMPLEMENTATION.md "Command Contract"
- * for the full bin/v-add-web-domain source trace behind "domain.create".
+ * script behavior). See DOMAIN_CREATE_IMPLEMENTATION.md and
+ * DOMAIN_DELETE_IMPLEMENTATION.md "Command Contract" sections for the
+ * full source traces behind "domain.create"/"domain.delete".
  *
  * Representation: a plain PHP associative array (trivially
  * json_encode()-able later) rather than an external JSON/YAML file. The
@@ -50,13 +52,12 @@ final class CommandRegistry {
 	/**
 	 * @param array<string, array<string, mixed>> $additionalOperations
 	 *        Test-only extension point: lets tests register a synthetic
-	 *        operation (e.g. a fake mutating one) without this class ever
-	 *        defining a real write operation itself — domain.create is
-	 *        explicitly not implemented yet. No production caller passes
-	 *        this argument; `new CommandRegistry()` with no arguments is
-	 *        unaffected. Entries here take precedence if a key collides
-	 *        with a built-in operation name (tests only; not a supported
-	 *        override mechanism for production use).
+	 *        operation (e.g. one with a made-up mutation kind) without this
+	 *        class needing a matching built-in entry for it. No production
+	 *        caller passes this argument; `new CommandRegistry()` with no
+	 *        arguments is unaffected. Entries here take precedence if a key
+	 *        collides with a built-in operation name (tests only; not a
+	 *        supported override mechanism for production use).
 	 */
 	public function __construct(array $additionalOperations = []) {
 		$this->operations = [
@@ -196,6 +197,48 @@ final class CommandRegistry {
 				// No "result_shape" key either, for the same reason: that
 				// field only has meaning for a JSON-producing operation.
 				"mutation" => ["kind" => "create"],
+			],
+			"domain.delete" => [
+				// bin/v-delete-web-domain, positional contract confirmed by
+				// direct source read: user=$1; domain=$2; restart=$3
+				// (bin/v-delete-web-domain lines 17-20) — only 3 positional
+				// slots (far simpler than v-add-web-domain's 6), only the
+				// first two required (check_args '2' "$#" ..., line 43). See
+				// DOMAIN_DELETE_IMPLEMENTATION.md "Command Contract" for the
+				// full trace.
+				"script" => "v-delete-web-domain",
+				"argument_order" => ["user", "domain", "restart"],
+				// Same minimal public parameter model as "domain.create":
+				// only the two values an operation to "delete this domain
+				// for this user" cannot function without are caller-supplied.
+				// Both types (username, domain) already exist and are
+				// reused as-is — no new validator was needed.
+				"parameters" => [
+					"user" => [
+						"type" => "username",
+						"required" => true,
+					],
+					"domain" => [
+						"type" => "domain",
+						"required" => true,
+					],
+				],
+				// restart="yes": fixed so the deletion's effects (removed
+				// vhost/proxy config) are applied immediately — the same
+				// choice already made for "domain.create", for the same
+				// reason (matches the one real production UI caller's own
+				// hardcoded 'yes' for the sibling create operation; no
+				// production caller for delete currently passes a
+				// caller-chosen restart value either).
+				"fixed_parameters" => [
+					"restart" => "yes",
+				],
+				// bin/v-delete-web-domain has no JSON output mode, no
+				// "format" argument, and no structured output at all —
+				// confirmed by reading the full script. Same as
+				// "domain.create": no "output_format"/"result_shape" key is
+				// declared, so parsed_output stays null, correctly.
+				"mutation" => ["kind" => "delete"],
 			],
 		];
 

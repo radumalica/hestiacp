@@ -704,10 +704,11 @@ listed here so they are not mistaken for oversights:
   `ARCHITECTURE_ADAPTER_DESIGN.md` section 5. The adapter's allowlist is an
   application-level control on top of that unchanged OS-level policy, not a
   replacement for it.
-- **Only three operations are registered** (as of the `domain.create`
-  pass): `domain.get`, `domain.list`, `domain.create`. `domain.delete`
-  and everything else from the design document's example table remain
-  unimplemented — this slice proves the mechanism, not the catalog.
+- **Only four operations are registered** (as of the `domain.delete`
+  pass, see `DOMAIN_DELETE_IMPLEMENTATION.md`): `domain.get`,
+  `domain.list`, `domain.create`, `domain.delete`. Everything else from
+  the design document's example table remains unimplemented — this
+  slice proves the mechanism, not the catalog.
 - **No composer/autoload integration.** `bootstrap.php` uses manual
   `require_once` rather than a PSR-4 autoload entry in
   `web/inc/composer.json`, per the "do not modify existing files" scope of

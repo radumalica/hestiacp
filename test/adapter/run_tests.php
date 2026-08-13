@@ -23,9 +23,11 @@ require_once __DIR__ . "/DomainListTest.php";
 require_once __DIR__ . "/LockManagerTest.php";
 require_once __DIR__ . "/MutatingOperationTest.php";
 require_once __DIR__ . "/DomainCreateTest.php";
+require_once __DIR__ . "/DomainDeleteTest.php";
 
 use Hestiacp\Adapter\Test\CommandAdapterTest;
 use Hestiacp\Adapter\Test\DomainCreateTest;
+use Hestiacp\Adapter\Test\DomainDeleteTest;
 use Hestiacp\Adapter\Test\DomainListTest;
 use Hestiacp\Adapter\Test\LockManagerTest;
 use Hestiacp\Adapter\Test\MiniTest;
@@ -39,4 +41,5 @@ DomainListTest::register($t);
 MutatingOperationTest::register($t);
 LockManagerTest::register($t);
 DomainCreateTest::register($t);
+DomainDeleteTest::register($t);
 exit($t->run());

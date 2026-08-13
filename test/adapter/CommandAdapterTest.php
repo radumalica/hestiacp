@@ -64,7 +64,12 @@ final class CommandAdapterTest {
 		$runner = new FakeProcessRunner(new ProcessResult(0, "", ""));
 		$adapter = self::buildAdapter($runner);
 
-		$result = $adapter->invoke("domain.delete", ["user" => "admin", "domain" => "example.com"]);
+		// "domain.delete" used to be the placeholder unregistered
+		// operation here; it is now a real, registered, mutating
+		// operation (see DomainDeleteTest.php), so "domain.rename" —
+		// explicitly not implemented anywhere in this codebase — takes
+		// over as the "genuinely unknown operation" case instead.
+		$result = $adapter->invoke("domain.rename", ["user" => "admin", "domain" => "example.com"]);
 
 		assertEquals("adapter_error", $result->status, "status");
 		assertEquals("UNKNOWN_OPERATION", $result->adapterErrorCode, "adapterErrorCode");

@@ -3,8 +3,11 @@
 Implementation report. This is the smallest working slice of the architecture
 proposed in `ARCHITECTURE_ADAPTER_DESIGN.md`, now covering two read-only
 operations — `domain.get` (mapped to `bin/v-list-web-domain`) and
-`domain.list` (mapped to `bin/v-list-web-domains`) — with no existing Hestia
-source file modified and no existing PHP call site migrated yet.
+`domain.list` (mapped to `bin/v-list-web-domains`) — plus one mutating
+operation, `domain.create` (mapped to `bin/v-add-web-domain`, see
+`DOMAIN_CREATE_IMPLEMENTATION.md`) — with no existing Hestia source file
+modified (apart from the two installer files, for the locking pass — see
+below) and no existing PHP call site migrated yet.
 
 **Update (this pass): `domain.list` added.** Everything below describing
 `domain.get` reflects the prior pass and is unchanged; new material for
@@ -21,10 +24,19 @@ for `$HESTIA/data/adapter-locks`, and `CommandAdapter` wiring (lock
 acquisition/release around mutating operations, `mutation_state`
 result semantics). Full details in `LOCK_IMPLEMENTATION.md`, which is
 the authoritative document for this pass; this file is updated only
-with the summary, file list, and test results below. **`domain.create`
-is still NOT implemented** — no mutating operation is registered in the
-production `CommandRegistry`; the locking code path is exercised only
-via a synthetic test-only entry (`test/adapter/MutatingOperationTest.php`).
+with the summary, file list, and test results below.
+
+**Update (this pass, latest of all): `domain.create` added — the first
+real mutating operation.** Maps to `bin/v-add-web-domain`. Full details,
+including the complete source trace of `bin/v-add-web-domain` and every
+helper it calls, are in `DOMAIN_CREATE_IMPLEMENTATION.md`, which is the
+authoritative document for this pass. **No file under `web/inc/adapter/`
+other than `CommandRegistry.php` changed for this pass** —
+`CommandAdapter.php` needed zero modification, which is itself the
+headline finding: the registry/locking/result-model mechanism built for
+two read-only operations absorbed the first write operation unchanged.
+`domain.delete` and every other operation remain unimplemented, as
+instructed.
 
 ---
 
@@ -101,7 +113,40 @@ use their current direct `exec()` path, unchanged, exactly as instructed.
     requirement mapping.
 
 `bin/v-add-web-domain`, `func/main.sh`, `web/inc/main.php`, and
-`web/api/index.php` remain unmodified.
+`web/api/index.php` remain unmodified as of the locking pass.
+
+### This pass (`domain.create`)
+
+15. **One new registry entry**, `domain.create` → `bin/v-add-web-domain`,
+    hand-verified against the full script source and every helper
+    function it calls — see `DOMAIN_CREATE_IMPLEMENTATION.md` "Command
+    Contract" for the complete trace. Only `user`/`domain` are public,
+    required parameters; `ip`/`restart`/`aliases`/`proxy_ext` are
+    registry-fixed to values matching the existing production UI
+    caller's own real-world usage (`web/add/web/index.php`) — see
+    "Parameter Model" in that document.
+16. **`"mutation" => ["kind" => "create"]`** on the new entry — the
+    existing (unmodified) locking/mutation-state machinery from the
+    locking pass now runs against a real script for the first time,
+    rather than only the synthetic test-only entry used to test it.
+17. **Zero changes to `CommandAdapter.php`, `AdapterResult.php`,
+    `LockManager.php`, or `ParameterValidator.php`.** The registry entry
+    alone was sufficient — no new validator, no new argv-building logic,
+    no operation-specific branch anywhere.
+18. **14 new unit tests** (`DomainCreateTest.php`) plus one necessary fix
+    to a pre-existing test (`DomainListTest::testUnknownOperationRejected`
+    had used `"domain.create"` as its "unregistered operation" placeholder
+    before this operation existed; now uses `"domain.delete"`) — see
+    `DOMAIN_CREATE_IMPLEMENTATION.md` "Tests" for the full A–O mapping.
+19. **A destructive, documented manual integration test** (Step 7 of
+    `test/adapter/MANUAL_INTEGRATION_TEST.md`), including cleanup
+    instructions, for verifying `domain.create` against a real Hestia
+    installation — not run automatically, by design.
+
+`bin/v-add-web-domain`, `func/main.sh`, `web/inc/main.php`,
+`web/api/index.php`, and `web/add/web/index.php` (the existing UI caller
+for this exact operation) remain unmodified. `domain.delete` and every
+other operation remain unimplemented.
 
 ---
 
@@ -158,9 +203,9 @@ only untracked additions under those two directories, plus this report and
 the two architecture docs from earlier passes).
 
 ```
-web/inc/adapter/AdapterResult.php            (MODIFIED — added $mutationState, docblock updates)
-web/inc/adapter/CommandAdapter.php           (MODIFIED — lock acquire/release, mutation_state)
-web/inc/adapter/CommandRegistry.php          (MODIFIED — "mutation" field on both entries, $additionalOperations param)
+web/inc/adapter/AdapterResult.php            (MODIFIED (locking pass) — added $mutationState, docblock updates; unchanged this pass)
+web/inc/adapter/CommandAdapter.php           (MODIFIED (locking pass) — lock acquire/release, mutation_state; unchanged this pass)
+web/inc/adapter/CommandRegistry.php          (MODIFIED — added "domain.create" entry, this pass)
 web/inc/adapter/LockManager.php              (NEW — real flock-based lock)
 web/inc/adapter/LockManagerInterface.php     (NEW)
 web/inc/adapter/LockUnavailableException.php (NEW)
@@ -176,33 +221,36 @@ test/adapter/ThrowingProcessRunner.php       (NEW — process-runner-throws test
 test/adapter/SpyLockManager.php              (NEW — LockManagerInterface test double)
 test/adapter/CommandAdapterTest.php          (unchanged)
 test/adapter/ProcOpenProcessRunnerTest.php   (unchanged)
-test/adapter/DomainListTest.php              (unchanged)
-test/adapter/LockManagerTest.php             (NEW — real flock, cross-process tests)
-test/adapter/MutatingOperationTest.php       (NEW — CommandAdapter-level lock wiring tests)
-test/adapter/fixtures/lock_holder.php        (NEW — subprocess fixture for cross-process tests)
-test/adapter/run_tests.php                   (MODIFIED — register the 2 new test classes)
-test/adapter/MANUAL_INTEGRATION_TEST.md      (MODIFIED — added Step 6, lock directory manual verification)
+test/adapter/DomainListTest.php              (MODIFIED, this pass — testUnknownOperationRejected now uses "domain.delete", not "domain.create")
+test/adapter/LockManagerTest.php             (unchanged this pass)
+test/adapter/MutatingOperationTest.php       (unchanged this pass)
+test/adapter/DomainCreateTest.php            (NEW, this pass — 14 tests for domain.create)
+test/adapter/fixtures/lock_holder.php        (unchanged this pass)
+test/adapter/run_tests.php                   (MODIFIED, this pass — register DomainCreateTest)
+test/adapter/MANUAL_INTEGRATION_TEST.md      (MODIFIED, this pass — added Step 7, domain.create manual test + cleanup)
 
 ADAPTER_VERTICAL_SLICE.md                    (this file, updated)
-LOCK_IMPLEMENTATION.md                       (NEW — authoritative locking design/implementation report)
+LOCK_IMPLEMENTATION.md                       (locking pass — unchanged this pass)
+DOMAIN_CREATE_IMPLEMENTATION.md              (NEW, this pass — authoritative domain.create design/implementation report)
 
-install/hst-install-ubuntu.sh                (MODIFIED — mkdir/chmod/chown for $HESTIA/data/adapter-locks, 2 locations)
-install/hst-install-debian.sh                (MODIFIED — identical change)
+install/hst-install-ubuntu.sh                (locking pass — unchanged this pass)
+install/hst-install-debian.sh                (locking pass — unchanged this pass)
 ```
 
-The two installer files are the ONLY pre-existing repository files touched
-across all three passes — confirmed by `git status --short` (below), and
-their diffs are limited to the two locations described in
-`LOCK_IMPLEMENTATION.md` "Lock Location". `$HESTIA/data/users` and its
-permissions are not touched by either diff.
+The two installer files remain the ONLY pre-existing repository files
+touched across all four passes — confirmed by `git status --short`/
+`git diff --stat` (below). `$HESTIA/data/users` and its permissions are
+untouched. `bin/v-add-web-domain`, `func/main.sh`, `web/inc/main.php`,
+`web/api/index.php`, and `web/add/web/index.php` remain unmodified.
 
 "MODIFIED" above means modified relative to the prior pass's own output —
 all of these files are still new/untracked relative to the repository's
 `main` branch; nothing that existed in the repository before the adapter
-work began has been touched at any point across either pass. No changes to:
-`web/inc/main.php`, `web/api/index.php`, `web/inc/composer.json`, any
-`bin/v-*` script, `func/main.sh`, `install/common/sudo/*`, or any other
-pre-existing file.
+work began has been touched at any point across any pass, apart from the
+two installer files. No changes to: `web/inc/main.php`,
+`web/api/index.php`, `web/add/web/index.php`, `web/inc/composer.json`,
+any `bin/v-*` script, `func/main.sh`, `install/common/sudo/*`, or any
+other pre-existing file.
 
 ---
 
@@ -257,19 +305,39 @@ PASS  I. path-traversal-shaped username is rejected before touching the filesyst
 PASS  release() is idempotent / safe when nothing is held
 PASS  C. two real subprocesses for the SAME user are serialized by the lock
 PASS  D. two real subprocesses for DIFFERENT users are not blocked by each other
+PASS  A. domain.create is registered in CommandRegistry
+PASS  B. valid parameters generate the expected v-add-web-domain argv
+PASS  C. unknown parameter ('ip', not part of the public schema) is rejected
+PASS  D. missing required parameter ('domain') is rejected
+PASS  E. invalid username is rejected before execution
+PASS  F. invalid domain is rejected before execution
+PASS  G. shell-metacharacter payloads cannot alter argv, never reach the process runner
+PASS  H. validation failures do not acquire the per-user lock
+PASS  I. lock timeout prevents v-add-web-domain execution
+PASS  J. successful execution: status=ok, mutation_state=confirmed
+PASS  K. non-zero execution: status=hestia_error, mutation_state=unknown
+PASS  L. exit code/stdout/stderr are preserved on failure
+PASS  M. the lock is released after a successful execution
+PASS  N. the lock is released after Hestia returns an error
 
-40 passed, 0 failed
+54 passed, 0 failed
 ```
 
 All PHP files across `web/inc/adapter/` and `test/adapter/` (new and
 modified) also pass `php -l` (syntax lint), individually verified. The 24
-tests from the prior two passes are unchanged and still pass unmodified
-(test requirement K), confirming the locking pass was added without
-regressing `domain.get`, `domain.list`, or the shared infrastructure. The
-full suite was run twice in a row to check for flakiness in the
-timing-sensitive, real-subprocess tests (C, D, E) — both runs passed
-identically. Full requirement-to-test mapping (A–K) for the locking pass
-is in `LOCK_IMPLEMENTATION.md` "Tests".
+tests from the first two passes and the 16 from the locking pass are
+unchanged and still pass (test requirement O for this pass, K for the
+locking pass), confirming `domain.create` was added without regressing
+`domain.get`, `domain.list`, or the shared/locking infrastructure — with
+one necessary pre-existing test fix, documented in
+`DOMAIN_CREATE_IMPLEMENTATION.md` "Tests" (`DomainListTest`'s "unknown
+operation" placeholder had to stop using the now-real `"domain.create"`
+name). The full suite was run twice in a row to check for flakiness in
+the timing-sensitive, real-subprocess tests (C, D, E under the locking
+group) — both runs passed identically. Full requirement-to-test mapping
+(A–O) for `domain.create` is in `DOMAIN_CREATE_IMPLEMENTATION.md`
+"Tests"; (A–K) for the locking pass is in `LOCK_IMPLEMENTATION.md`
+"Tests".
 
 ### Mapping to the 8 requested proof points (`domain.get`, prior pass)
 
@@ -636,9 +704,10 @@ listed here so they are not mistaken for oversights:
   `ARCHITECTURE_ADAPTER_DESIGN.md` section 5. The adapter's allowlist is an
   application-level control on top of that unchanged OS-level policy, not a
   replacement for it.
-- **Only one operation is registered.** `domain.list`, `domain.create`, and
-  everything else from the design document's example table are not
-  implemented — this slice proves the mechanism, not the catalog.
+- **Only three operations are registered** (as of the `domain.create`
+  pass): `domain.get`, `domain.list`, `domain.create`. `domain.delete`
+  and everything else from the design document's example table remain
+  unimplemented — this slice proves the mechanism, not the catalog.
 - **No composer/autoload integration.** `bootstrap.php` uses manual
   `require_once` rather than a PSR-4 autoload entry in
   `web/inc/composer.json`, per the "do not modify existing files" scope of
@@ -656,15 +725,14 @@ listed here so they are not mistaken for oversights:
 
 ## Is the abstraction ready for `domain.create` (a write operation)?
 
-**Updated after the locking pass: both prerequisites this section
-previously named — locking and mutation-state result semantics — are now
-implemented and tested (`LOCK_IMPLEMENTATION.md`, `WRITE_OPERATION_DESIGN.md`).
-`domain.create` itself is still not implemented, and nothing below should
-be read as recommending it be added without a further explicit go-ahead
-(this task's own scope excludes it), but the two structural blockers are
-resolved.** The rest of this section is left as written during the
-`domain.list` pass, for historical record of what was evaluated and when,
-followed by an updated recommendation.
+**Superseded: `domain.create` is now implemented — see
+`DOMAIN_CREATE_IMPLEMENTATION.md`.** This section is kept verbatim below
+as the historical record of what was evaluated, when, and why, across
+the `domain.list` and locking passes that preceded it — it correctly
+predicted both prerequisites (locking, mutation-state semantics) and,
+once both were resolved, correctly predicted that adding
+`domain.create` itself would require zero changes to
+`CommandAdapter.php` (confirmed: it needed none).
 
 **What this pass confirmed generalizes cleanly, with evidence:**
 

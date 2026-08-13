@@ -137,7 +137,13 @@ final class DomainListTest {
 		$runner = new FakeProcessRunner(new ProcessResult(0, "", ""));
 		$adapter = self::buildAdapter($runner);
 
-		$result = $adapter->invoke("domain.create", ["user" => "admin", "domain" => "example.com"]);
+		// "domain.create" used to be the placeholder unregistered
+		// operation here, back when this test was written; it is now a
+		// real, registered, mutating operation (see DomainCreateTest.php),
+		// so "domain.delete" — explicitly NOT implemented anywhere in
+		// this codebase — takes over as the "genuinely unknown operation"
+		// case instead.
+		$result = $adapter->invoke("domain.delete", ["user" => "admin", "domain" => "example.com"]);
 
 		assertEquals("adapter_error", $result->status, "status");
 		assertEquals("UNKNOWN_OPERATION", $result->adapterErrorCode, "adapterErrorCode");

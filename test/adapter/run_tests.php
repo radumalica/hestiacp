@@ -22,8 +22,10 @@ require_once __DIR__ . "/ProcOpenProcessRunnerTest.php";
 require_once __DIR__ . "/DomainListTest.php";
 require_once __DIR__ . "/LockManagerTest.php";
 require_once __DIR__ . "/MutatingOperationTest.php";
+require_once __DIR__ . "/DomainCreateTest.php";
 
 use Hestiacp\Adapter\Test\CommandAdapterTest;
+use Hestiacp\Adapter\Test\DomainCreateTest;
 use Hestiacp\Adapter\Test\DomainListTest;
 use Hestiacp\Adapter\Test\LockManagerTest;
 use Hestiacp\Adapter\Test\MiniTest;
@@ -36,4 +38,5 @@ ProcOpenProcessRunnerTest::register($t);
 DomainListTest::register($t);
 MutatingOperationTest::register($t);
 LockManagerTest::register($t);
+DomainCreateTest::register($t);
 exit($t->run());

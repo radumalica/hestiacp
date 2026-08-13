@@ -1,4 +1,4 @@
-# Manual Integration Test — Command Adapter `domain.get`
+# Manual Integration Test — Command Adapter `domain.get`, `domain.list`, `domain.create`
 
 This is a documented manual procedure, to be run by a human on a real Hestia
 installation. It is intentionally not automated in CI because it requires
@@ -123,14 +123,14 @@ real Hestia installation, produces output equivalent to today's direct
 `exec()` pattern for both success and failure cases, and that caller-side
 validation failures never reach the underlying script.
 
-**Does not prove**: performance under load, or anything about operations
-other than `domain.get`/`domain.list`, since no mutating operation
-(`domain.create` or otherwise) is registered yet — see
-`ADAPTER_VERTICAL_SLICE.md` "known limitations". The per-user locking
-infrastructure now exists (`LockManager`) but is exercised by neither
-`domain.get` nor `domain.list`, both of which are read-only and never
-acquire a lock; see the section below for what locking-specific manual
-verification IS possible today, ahead of the first mutating operation.
+**Does not prove**: performance under load, behavior under load-bearing
+production traffic, or anything about `domain.delete` or any other
+operation not implemented in this codebase (see
+`ADAPTER_VERTICAL_SLICE.md` "known limitations"). Steps 1-6 cover the two
+read-only operations (which never acquire a lock); Step 7 covers
+`domain.create`, the first — and, as of this document, only — mutating
+operation, including its real per-user lock acquisition against the real
+`$HESTIA/data/adapter-locks/` directory.
 
 ## Step 6 — Manual verification: lock directory (locking infrastructure only)
 
@@ -196,3 +196,112 @@ been run with this branch's installer changes.
    touches `data/adapter-locks` at all, so it is unaffected by any of
    this change; it is included here only as a smoke test that nothing
    else on the server was disturbed.
+
+## Step 7 — Manual verification: `domain.create` (MUTATING — creates real state)
+
+**This step is destructive.** It creates an actual web domain (directories,
+vhost config, log files, a `web.conf` entry, and a running web server
+reload) on the target server. Do NOT run this in CI or against a
+production Hestia instance. Use a disposable test user and a domain name
+that does not need to resolve anywhere (Hestia does not verify DNS before
+creating the vhost). Follow "Cleanup" below immediately after.
+
+### 7a — Baseline: confirm the domain does not already exist
+
+```bash
+sudo /usr/local/hestia/bin/v-list-web-domain testuser adapter-manual-test.example json
+echo "exit code: $?"
+```
+
+Expected: non-zero exit (E_NOTEXIST), confirming a clean starting state.
+
+### 7b — Run `domain.create` through the adapter
+
+Extend `/tmp/adapter-manual-test.php` from Step 2 (or create a fresh copy):
+
+```php
+<?php
+
+require_once "/path/to/hestiacp/web/inc/adapter/bootstrap.php";
+
+use Hestiacp\Adapter\CommandAdapter;
+use Hestiacp\Adapter\CommandRegistry;
+use Hestiacp\Adapter\ProcOpenProcessRunner;
+
+$adapter = new CommandAdapter(
+	new CommandRegistry(),
+	new ProcOpenProcessRunner()
+	// LockManager also left at its default — the real
+	// $HESTIA/data/adapter-locks/ directory, exercised for real here.
+);
+
+$result = $adapter->invoke(
+	"domain.create",
+	["user" => "testuser", "domain" => "adapter-manual-test.example"],
+	["user" => "testuser"]
+);
+
+echo json_encode($result->toArray(), JSON_PRETTY_PRINT) . "\n";
+```
+
+```bash
+php /tmp/adapter-manual-test.php
+```
+
+### 7c — Verify
+
+1. `status` is `"ok"`, `mutation_state` is `"confirmed"`, `exit_code` is `0`.
+2. `$HOMEDIR/testuser/web/adapter-manual-test.example/` now exists, owned
+   `testuser:testuser`, containing `public_html/`, `private/`,
+   `document_errors/`, `cgi-bin/`, `stats/`, `logs/` (bin/v-add-web-domain
+   lines 100-107).
+3. `$USER_DATA/web.conf` (i.e.
+   `/usr/local/hestia/data/users/testuser/web.conf`) gained one new line
+   with `DOMAIN='adapter-manual-test.example'` (line 241 of
+   bin/v-add-web-domain).
+4. Re-running Step 7a now returns exit code `0` with a JSON body
+   describing the domain.
+5. The web server (nginx/apache2, per `$WEB_SYSTEM`) was reloaded without
+   error — confirm with `systemctl status $WEB_SYSTEM` or equivalent, and
+   check the adapter result's `stdout`/`stderr` for any
+   `"... restart failed"` text (bin/v-add-web-domain lines 250-251).
+6. **Lock proof**: while step 7b is running (e.g. by adding a `sleep 2`
+   right before `v-add-web-domain` in a scratch copy of the script, or by
+   running two `domain.create` calls for the SAME `testuser` back to
+   back from two terminals), confirm the second call visibly waits — this
+   is the same per-user serialization already proven automatically in
+   `test/adapter/LockManagerTest.php`'s cross-process tests, here observed
+   against the real script instead of a fixture.
+
+### 7d — Negative case: duplicate domain
+
+Re-run 7b with the same parameters a second time. Confirm:
+
+1. `status` is `"hestia_error"`, `hestia_error_code` is `"E_EXISTS"`
+   (bin/v-add-web-domain's `is_web_domain_new()`, func/domain.sh line 49:
+   `check_result "$E_EXISTS" "Web domain $1 exists"` — detected during
+   this script's own "Verifications" section, before any directory is
+   created).
+2. `mutation_state` is `"unknown"` — not `"not_attempted"` — since the
+   adapter has no operation-specific knowledge that E_EXISTS in
+   particular always fires pre-mutation; that fact is documented in
+   `DOMAIN_CREATE_IMPLEMENTATION.md` "Idempotency / Duplicate Domain" as
+   something confirmed by reading the source for this report, not
+   something the adapter's generic result model claims to know.
+3. No second copy of the domain directory or `web.conf` entry was
+   created (confirm the directory/file from 7c are unchanged).
+
+### Cleanup
+
+```bash
+sudo /usr/local/hestia/bin/v-delete-web-domain testuser adapter-manual-test.example
+```
+
+Confirm the domain no longer appears in
+`sudo /usr/local/hestia/bin/v-list-web-domains testuser json`, and that
+`$HOMEDIR/testuser/web/adapter-manual-test.example/` no longer exists.
+If a disposable `testuser` was created solely for this test, also remove
+it with `sudo /usr/local/hestia/bin/v-delete-user testuser` — note
+`LOCK_IMPLEMENTATION.md` "Known Limitations": this leaves an orphaned
+`testuser.lock` file under `$HESTIA/data/adapter-locks/`, which is
+expected and harmless (see that document for why).

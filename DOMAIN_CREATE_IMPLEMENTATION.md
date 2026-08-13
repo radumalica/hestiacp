@@ -334,10 +334,21 @@ attempt the lock) and I (a timed-out lock never spawns
 
 # Mutation Semantics
 
-Exactly the three-value model from `WRITE_OPERATION_DESIGN.md`, applied
-here without any operation-specific exception:
+> **Updated by `MUTATION_AND_AUTHORIZATION_DESIGN.md`.** The three-value
+> model below (`not_attempted`/`confirmed`/`unknown`) was this
+> operation's original model. It has since been extended to four values;
+> see that document's Part 1 and its "Implementation Note" section for
+> the `confirmed_degraded` state and the registry-driven
+> `known_post_mutation_exit_codes` mechanism that now applies to
+> `domain.create`'s own `E_RESTART` case specifically. The table below is
+> retained for historical/read-only-operation context but is no longer a
+> complete description of `domain.create`'s failure-path classification.
 
-| Condition | `mutation_state` |
+Exactly the three-value model from `WRITE_OPERATION_DESIGN.md`, applied
+here without any operation-specific exception, as this operation was
+originally implemented:
+
+| Condition | `mutation_state` (as originally implemented) |
 |---|---|
 | Unknown operation | `null` (mutation status of an unknown operation is unknowable — same as every other operation) |
 | Unexpected parameter | `not_attempted` |
@@ -348,14 +359,20 @@ here without any operation-specific exception:
 | `v-add-web-domain` exits `0` | `confirmed` |
 | `v-add-web-domain` exits non-zero, for ANY reason, including `E_EXISTS` (duplicate domain) or `E_RESTART` (reload failure after config was already written) | `unknown` |
 
-**No `partial_failure` value exists anywhere in this codebase.** The
-`E_EXISTS` (duplicate domain) and `E_RESTART` (post-mutation reload
-failure) cases are exactly the two scenarios `WRITE_OPERATION_DESIGN.md`
-predicted would tempt a more specific label — and both still resolve to
-the same generic `unknown`, per that document's Part 4/5 and this task's
-explicit instruction not to introduce a new state. See "Idempotency /
-Duplicate Domain" and "Error Handling" below for the source evidence
-behind each.
+**As of `MUTATION_AND_AUTHORIZATION_DESIGN.md`'s implementation, this
+last row is superseded for `E_RESTART` specifically:** the
+`domain.create` registry entry now declares
+`mutation.known_post_mutation_exit_codes = ["E_RESTART"]`, so an
+`E_RESTART` failure now classifies as `confirmed_degraded`, not
+`unknown` — see `MutationClassificationTest.php` and
+`DomainCreateTest.php` test P. `E_EXISTS` and every other non-zero exit
+code not declared in that list still classify as `unknown`, exactly as
+originally implemented. No `partial_failure` value exists anywhere in
+this codebase — `confirmed_degraded` is the one new state, and it is
+driven entirely by registry data, never by an operation-specific check
+inside `CommandAdapter`. See "Idempotency / Duplicate Domain" and "Error
+Handling" below for the source evidence behind the `E_EXISTS`/`E_RESTART`
+distinction.
 
 # Error Handling
 

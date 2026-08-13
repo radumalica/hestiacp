@@ -44,6 +44,18 @@ namespace Hestiacp\Adapter;
  * only ever needs to ask "is kind === 'read'?". Adding them back is the
  * same kind of mechanical follow-up as the fields above, if a concrete
  * consumer appears.
+ *
+ * "mutation.known_post_mutation_exit_codes" was added in the
+ * MUTATION_AND_AUTHORIZATION_DESIGN.md pass — an optional list of
+ * symbolic Hestia error names (e.g. "E_RESTART") that a registry author
+ * has positively verified, from the underlying script's own source, can
+ * ONLY occur after that operation's core mutation is durably complete.
+ * Drives CommandAdapter's mutation_state = "confirmed_degraded"
+ * classification generically, with no per-operation code in
+ * CommandAdapter itself. Validated against
+ * CommandAdapter::HESTIA_EXIT_CODES at construction time (see
+ * validateMutationMetadata() below) so a typo'd symbolic name fails
+ * loudly rather than silently never matching.
  */
 final class CommandRegistry {
 	/** @var array<string, array<string, mixed>> */
@@ -196,7 +208,22 @@ final class CommandRegistry {
 				// not a gap, it is the correct behavior for this script.
 				// No "result_shape" key either, for the same reason: that
 				// field only has meaning for a JSON-producing operation.
-				"mutation" => ["kind" => "create"],
+				//
+				// known_post_mutation_exit_codes: E_RESTART (20) is the
+				// ONLY exit code bin/v-add-web-domain can produce AFTER its
+				// core mutation (the $USER_DATA/web.conf append, line 245)
+				// is already durably complete — confirmed by source read:
+				// $BIN/v-restart-web/v-restart-proxy (lines 250-254) run
+				// strictly after that append, and every OTHER non-zero exit
+				// this script can produce (E_ARGS, E_INVALID, E_NOTEXIST,
+				// E_EXISTS, E_SUSPENDED, E_LIMIT, E_DISABLED) fires during
+				// its earlier "Verifications" section. See
+				// DOMAIN_CREATE_IMPLEMENTATION.md "Service Reload / Failure
+				// Semantics" and MUTATION_AND_AUTHORIZATION_DESIGN.md Part
+				// 1/3 for the full reasoning behind why ONLY this specific,
+				// source-verified code is declared here — never a broader
+				// or guessed set.
+				"mutation" => ["kind" => "create", "known_post_mutation_exit_codes" => ["E_RESTART"]],
 			],
 			"domain.delete" => [
 				// bin/v-delete-web-domain, positional contract confirmed by
@@ -238,12 +265,66 @@ final class CommandRegistry {
 				// confirmed by reading the full script. Same as
 				// "domain.create": no "output_format"/"result_shape" key is
 				// declared, so parsed_output stays null, correctly.
-				"mutation" => ["kind" => "delete"],
+				//
+				// known_post_mutation_exit_codes: E_RESTART (20) is, by the
+				// same source-verified reasoning as "domain.create" above,
+				// the ONLY exit code bin/v-delete-web-domain can produce
+				// after its core mutation (the domain's directories and
+				// $USER_DATA/web.conf line, both already removed by line
+				// 116) is complete — its three restart calls (lines
+				// 148-156) run strictly after. Every other reachable exit
+				// code (E_ARGS, E_INVALID, E_NOTEXIST, E_DISABLED) fires
+				// during "Verifications." See
+				// DOMAIN_DELETE_IMPLEMENTATION.md "Mutation Semantics" and
+				// MUTATION_AND_AUTHORIZATION_DESIGN.md Part 1/3.
+				"mutation" => ["kind" => "delete", "known_post_mutation_exit_codes" => ["E_RESTART"]],
 			],
 		];
 
 		foreach ($additionalOperations as $name => $entry) {
 			$this->operations[$name] = $entry;
+		}
+
+		self::validateMutationMetadata($this->operations);
+	}
+
+	/**
+	 * Fails fast, loudly, at construction time, rather than letting a
+	 * typo'd symbolic Hestia error name (e.g. "E_RESTAR") silently
+	 * compile into a registry entry that can never actually reach
+	 * CommandAdapter's confirmed_degraded classification — see
+	 * MUTATION_AND_AUTHORIZATION_DESIGN.md Part 3.
+	 *
+	 * Validates against CommandAdapter::HESTIA_EXIT_CODES — the SAME,
+	 * single, authoritative int-to-symbolic-name table CommandAdapter
+	 * already uses to populate AdapterResult::$hestiaErrorCode. No second
+	 * exit-code vocabulary is introduced by this check.
+	 *
+	 * @param array<string, array<string, mixed>> $operations
+	 */
+	private static function validateMutationMetadata(array $operations): void {
+		$validNames = array_flip(CommandAdapter::HESTIA_EXIT_CODES);
+
+		foreach ($operations as $operationName => $entry) {
+			$declared = $entry["mutation"]["known_post_mutation_exit_codes"] ?? [];
+			if (!is_array($declared)) {
+				throw new \InvalidArgumentException(sprintf(
+					"Registry entry '%s' declares mutation.known_post_mutation_exit_codes as %s, but it must be an array of symbolic Hestia error code strings.",
+					$operationName,
+					gettype($declared)
+				));
+			}
+			foreach ($declared as $code) {
+				if (!isset($validNames[$code])) {
+					throw new \InvalidArgumentException(sprintf(
+						"Registry entry '%s' declares an unknown symbolic Hestia error code '%s' in " .
+							"mutation.known_post_mutation_exit_codes. Valid codes are: %s",
+						$operationName,
+						is_string($code) ? $code : var_export($code, true),
+						implode(", ", array_keys($validNames))
+					));
+				}
+			}
 		}
 	}
 

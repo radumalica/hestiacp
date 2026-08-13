@@ -1,8 +1,11 @@
 # Mutation and Authorization Design
 
-Design only. No source code was modified to produce this document. No
-new operation was added. No API v2, no authorization, no registry
-change was implemented.
+Design only, as originally written — no source code was modified to
+produce this document, no new operation was added, and no API v2, no
+authorization, no registry change was implemented at the time. **The two
+designs below have since been implemented; see the "Implementation
+Note" section at the end of this document for what was actually
+built.**
 
 **Purpose**: `domain.create` and `domain.delete` are now two independent,
 real, source-verified mutating operations. This document turns the
@@ -887,3 +890,72 @@ tasks has proceeded so far.
   qualifier would be false. Not a blocker for continuing to design or
   build the adapter itself; a hard blocker for describing the SYSTEM
   (not just the adapter) as protected by any of these properties.
+
+---
+
+# Implementation Note
+
+The two designs above (mutation-state classification and the
+authorization seam) have since been implemented. This note describes
+what was actually built, without rewriting the design narrative above.
+
+**Mutation state** (`AdapterResult::$mutationState`) now has four
+values instead of three: `not_attempted`, `confirmed`,
+`confirmed_degraded`, `unknown`. A resolved registry entry may declare
+`mutation.known_post_mutation_exit_codes` — an array of symbolic Hestia
+error names (e.g. `["E_RESTART"]`) verified, from source, to occur only
+after that operation's mutation is durably complete. `CommandAdapter`
+classifies a non-zero exit as `confirmed_degraded` when the resolved
+Hestia error code appears in that declared list, `unknown` otherwise —
+entirely data-driven, with zero exit-code- or error-name-specific
+branching inside `CommandAdapter` itself (proved behaviorally by
+`MutationClassificationTest::testSameExitCodeDifferentOutcomesPerRegistryEntry`,
+which sends the identical exit code through two registry entries, one
+declaring it and one not, and gets two different outcomes). The field is
+optional and additive: an entry that omits it behaves exactly as before
+this change. `domain.create` and `domain.delete` each now declare
+`["E_RESTART"]`, matching the evidence in Part 1 above; no other
+operation's registry entry was touched. `CommandRegistry` validates
+every declared symbolic name against `CommandAdapter::HESTIA_EXIT_CODES`
+(widened from `private` to `public const` to make this possible) at
+construction time, so a typo fails loudly rather than silently compiling
+into an operation that can never reach `confirmed_degraded`.
+
+**Authorization seam**: `AuthorizerInterface::authorize(string
+$operation, array $target, array $actor): bool` — a single yes/no
+question, mirroring the existing `ProcessRunnerInterface`/
+`LockManagerInterface` dependency-injection pattern. `CommandAdapter`
+takes an 8th, optional constructor parameter (`?AuthorizerInterface
+$authorizer = null`), defaulting to a new `AllowAllAuthorizer` — the
+seam is unconditionally consulted on every resolved, validated
+operation (read or mutating), but its default POLICY is fully
+permissive, preserving every existing trusted-caller code path and
+constructor signature unchanged. Ordering inside `invoke()` is fixed:
+operation resolution → parameter validation → target normalization →
+**authorization** → lock acquisition → process execution. A denial
+returns before either the lock or the process runner is ever touched,
+represented with the existing result model (`status="adapter_error"`,
+`adapterErrorCode="AUTHORIZATION_DENIED"`) rather than a new status
+enum, per Part 9's "use the existing model if it fits" guidance.
+`CommandAdapter` supplies only the operation name and the already-
+validated target/normalized-actor to the seam; it contains no role,
+scope, or delegation policy of any kind.
+
+**Tests**: `MutationClassificationTest.php` (state-classification
+behavior), `CommandRegistryValidationTest.php` (registry-field
+validation), `AuthorizationTest.php` (authorization ordering, denial
+behavior, and all of Part 11's security invariants — including, using
+the real `LockManager`, that a denied request never acquires the
+mutation lock), plus targeted additions to `DomainCreateTest.php` and
+`DomainDeleteTest.php` covering each operation's own `E_RESTART` →
+`confirmed_degraded` case. All are wired into
+`test/adapter/run_tests.php`.
+
+**What remains intentionally unimplemented**, unchanged from the
+BLOCKERS section above: any actual authorization POLICY (roles,
+reseller/hosting-user/service-account scoping, delegation rules) behind
+the seam — `AllowAllAuthorizer` is the only implementation that exists;
+API v2 and HTTP status-code mapping; sudoers narrowing; legacy-caller
+migration; Marketplace support. The seam guarantees a decision point
+exists and is always consulted — it does not, by itself, restrict
+anything.

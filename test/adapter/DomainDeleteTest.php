@@ -243,13 +243,13 @@ final class DomainDeleteTest {
 		// check_result after $BIN/v-restart-web/v-restart-proxy/
 		// v-restart-web-backend (lines 148-157) — these run AFTER the
 		// domain has already been fully deleted (directories removed,
-		// web.conf line removed, lines 89/115-116). This is the
-		// domain.delete analogue of domain.create's E_RESTART case: a
-		// non-zero exit where the mutation is, per source, DEFINITELY
-		// complete, yet the generic model still reports 'unknown' rather
-		// than 'confirmed' — see DOMAIN_DELETE_IMPLEMENTATION.md's
-		// "Mutation Semantics" for why this is flagged as a finding for a
-		// later architecture decision, not fixed here.
+		// web.conf line removed, lines 89/115-116). This was the finding
+		// DOMAIN_DELETE_IMPLEMENTATION.md flagged for a later architecture
+		// decision — MUTATION_AND_AUTHORIZATION_DESIGN.md made that
+		// decision, and CommandRegistry's "domain.delete" entry now
+		// declares "E_RESTART" under mutation.known_post_mutation_exit_codes,
+		// so this now-source-verified-complete mutation correctly reports
+		// 'confirmed_degraded', not 'unknown'.
 		$runner = new FakeProcessRunner(new ProcessResult(20, "", "Error: Web restart failed"));
 		$adapter = self::buildAdapter($runner);
 
@@ -257,7 +257,7 @@ final class DomainDeleteTest {
 
 		assertEquals("hestia_error", $result->status, "status");
 		assertEquals("E_RESTART", $result->hestiaErrorCode, "exit code 20 must map to E_RESTART per func/main.sh's E_* table");
-		assertEquals("unknown", $result->mutationState, "mutation_state stays 'unknown' even though the deletion itself is, per source, already complete at this point — the generic model does not special-case this");
+		assertEquals("confirmed_degraded", $result->mutationState, "mutation_state must be 'confirmed_degraded': the registry declares E_RESTART as a known post-mutation exit code for domain.delete, and the deletion is, per source, already complete at this point");
 	}
 
 	public static function testStreamsPreserved(): void {

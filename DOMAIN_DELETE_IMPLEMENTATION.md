@@ -307,11 +307,30 @@ an `E_DISABLED` example.
 
 ## 9. Mutation State Behavior
 
-`mutation_state` is `confirmed` for exit `0`, `unknown` for any non-zero
-exit — the same, unmodified two-line derivation in `CommandAdapter.php`
-(`$mutationState = $processResult->exitCode === 0 ? "confirmed" :
-"unknown"`, gated on `$isMutating`). No new value was introduced, per
-this task's explicit instruction.
+> **Resolved by `MUTATION_AND_AUTHORIZATION_DESIGN.md`.** The finding
+> below — that `domain.delete`'s `E_RESTART` failure is per-source
+> always post-mutation, and that this warranted a per-registry-entry
+> "known-post-mutation exit codes" field rather than a generic
+> `unknown` label — has since been implemented exactly as this section
+> speculated it would be shaped. `domain.delete`'s registry entry now
+> declares `mutation.known_post_mutation_exit_codes = ["E_RESTART"]`,
+> and `CommandAdapter` now classifies a non-zero exit as
+> `confirmed_degraded` (a new, fourth `mutation_state` value) when the
+> resolved Hestia error code is present in that declared list, `unknown`
+> otherwise — entirely data-driven, with no `E_RESTART`-specific (or any
+> other exit-code-specific) branch inside `CommandAdapter` itself. See
+> that document's "Implementation Note" section, `DomainDeleteTest.php`'s
+> `testRestartFailure`, and `MutationClassificationTest.php` for the
+> current behavior and its tests. The description below reflects this
+> operation's ORIGINAL implementation and the finding as originally
+> surfaced, before that resolution.
+
+`mutation_state` was originally `confirmed` for exit `0`, `unknown` for
+any non-zero exit — the same, unmodified two-line derivation in
+`CommandAdapter.php` (`$mutationState = $processResult->exitCode === 0 ?
+"confirmed" : "unknown"`, gated on `$isMutating`). No new value was
+introduced at the time this operation was first implemented, per that
+task's explicit instruction.
 
 **The finding this task specifically asked to surface, not implement**:
 `domain.delete`'s exit-code surface is *cleaner* than `domain.create`'s
@@ -465,8 +484,12 @@ two independent, source-verified examples of the exact same underlying
 pattern (`E_RESTART` firing strictly after a complete, durable
 mutation), which is precisely the evidence
 `ADAPTER_ARCHITECTURE_CHECKPOINT.md` asked to be collected before
-designing a richer model. **No implementation change was made — per
-this task's explicit instruction — only documentation of the finding.**
+designing a richer model. **No implementation change was made at the
+time — per this task's explicit instruction — only documentation of the
+finding. This gap has since been closed by
+`MUTATION_AND_AUTHORIZATION_DESIGN.md`'s `confirmed_degraded` state and
+registry-driven `known_post_mutation_exit_codes`; see the update at the
+top of Section 9.**
 
 ### E. Did it expose a limitation in the per-user locking model?
 
@@ -485,13 +508,19 @@ Listed, per this task's instruction — **not implemented**:
 - **`domain.delete` is user-scoped at the Hestia CLI level**, meaning a
   future `DELETE /api/v2/domains/{domain}` cannot rely on `{domain}`
   alone to identify the resource — it needs the owning user too (today,
-  from `$target["user"]`, which itself currently comes from
-  `$actor`/request context with no enforcement — see
-  `ADAPTER_ARCHITECTURE_CHECKPOINT.md` Section 4's authorization gap,
-  restated here as concretely relevant to THIS operation specifically:
-  without an authZ layer, nothing stops one user's session from
-  supplying a DIFFERENT user's identity as the `user` parameter and
-  deleting THAT user's domain).
+  from `$target["user"]`, which itself comes from `$actor`/request
+  context — see `ADAPTER_ARCHITECTURE_CHECKPOINT.md` Section 4's
+  authorization gap, restated here as concretely relevant to THIS
+  operation specifically: at the time this was written, without an authZ
+  layer, nothing stopped one user's session from supplying a DIFFERENT
+  user's identity as the `user` parameter and deleting THAT user's
+  domain. `MUTATION_AND_AUTHORIZATION_DESIGN.md` has since added a
+  structural authorization seam (`AuthorizerInterface`) that every
+  operation now passes through — but its DEFAULT implementation,
+  `AllowAllAuthorizer`, still permits exactly this, by design (per that
+  document's Part 7): the seam guarantees an authorization decision is
+  always consulted, but supplying an actual policy that would deny
+  cross-user access remains future, out-of-adapter work).
 - **Deletion is irreversible at the Hestia CLI level** ("not fully
   supported by 'undo' function... recovery is possible only with a help
   of reserve copy" — the script's own header comment, and independently

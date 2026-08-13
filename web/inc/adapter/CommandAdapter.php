@@ -17,12 +17,25 @@ namespace Hestiacp\Adapter;
  *
  * Per-user locking for mutating operations (WRITE_OPERATION_DESIGN.md,
  * LOCK_PERMISSION_REVIEW.md, LOCK_IMPLEMENTATION.md) IS implemented — see
- * $lockManager and the mutation-kind check in invoke(). NOT implemented
- * in this slice (see ADAPTER_VERTICAL_SLICE.md "known limitations" for
- * the full list and reasoning): audit persistence, timeouts/cancellation
- * of the underlying process itself (only lock ACQUISITION has a
- * timeout), sensitive-argument redaction beyond what is inherent in the
- * minimal parameter set used so far.
+ * $lockManager and the mutation-kind check in invoke().
+ *
+ * An authorization seam (MUTATION_AND_AUTHORIZATION_DESIGN.md Part 4-9)
+ * IS implemented — see $authorizer. CommandAdapter structurally
+ * guarantees $authorizer->authorize() is consulted for EVERY resolved,
+ * validated request (read or mutating), after parameter validation and
+ * before lock acquisition/process execution — but CommandAdapter itself
+ * contains, and must always contain, zero authorization POLICY (no
+ * roles, no scopes, no delegation rules). The default
+ * AllowAllAuthorizer preserves today's fully-trusted-internal-caller
+ * behavior exactly; a real policy-checking implementation is expected to
+ * be injected by a future service layer, never written inside this
+ * class.
+ *
+ * NOT implemented in this slice (see ADAPTER_VERTICAL_SLICE.md "known
+ * limitations" for the full list and reasoning): audit persistence,
+ * timeouts/cancellation of the underlying process itself (only lock
+ * ACQUISITION has a timeout), sensitive-argument redaction beyond what
+ * is inherent in the minimal parameter set used so far.
  */
 final class CommandAdapter {
 	private CommandRegistry $registry;
@@ -30,6 +43,7 @@ final class CommandAdapter {
 	private string $binDir;
 	private string $sudoBinary;
 	private LockManagerInterface $lockManager;
+	private AuthorizerInterface $authorizer;
 	/** @var callable(): float */
 	private $clock;
 	/** @var callable(): string */
@@ -51,9 +65,17 @@ final class CommandAdapter {
 	 * This adapter does not invent a new error-code space; it adopts
 	 * Hestia's existing one, per ARCHITECTURE_ADAPTER_DESIGN.md section 4.
 	 *
+	 * Public (not private): CommandRegistry::validateMutationMetadata()
+	 * validates each registry entry's declared
+	 * "mutation.known_post_mutation_exit_codes" symbolic names against
+	 * this SAME table (MUTATION_AND_AUTHORIZATION_DESIGN.md Part 3) — the
+	 * smallest possible change to make the one existing, authoritative
+	 * exit-code vocabulary reachable from the registry layer, deliberately
+	 * NOT a second table and NOT a relocation of this one.
+	 *
 	 * @var array<int, string>
 	 */
-	private const HESTIA_EXIT_CODES = [
+	public const HESTIA_EXIT_CODES = [
 		0 => "OK",
 		1 => "E_ARGS",
 		2 => "E_INVALID",
@@ -84,13 +106,19 @@ final class CommandAdapter {
 		string $sudoBinary = "/usr/bin/sudo",
 		?callable $clock = null,
 		?callable $idGenerator = null,
-		?LockManagerInterface $lockManager = null
+		?LockManagerInterface $lockManager = null,
+		?AuthorizerInterface $authorizer = null
 	) {
 		$this->registry = $registry;
 		$this->runner = $runner;
 		$this->binDir = rtrim($binDir, "/") . "/";
 		$this->sudoBinary = $sudoBinary;
 		$this->lockManager = $lockManager ?? new LockManager();
+		// Never conditional on "was an authorizer supplied" — the seam is
+		// ALWAYS consulted (see invoke()); only the default POLICY behind
+		// it is permissive. See AllowAllAuthorizer's own docblock and
+		// MUTATION_AND_AUTHORIZATION_DESIGN.md Part 7.
+		$this->authorizer = $authorizer ?? new AllowAllAuthorizer();
 		$this->clock = $clock ?? static function (): float {
 			return microtime(true);
 		};
@@ -232,6 +260,32 @@ final class CommandAdapter {
 			}
 
 			$target[$name] = $value;
+		}
+
+		// Authorization (MUTATION_AND_AUTHORIZATION_DESIGN.md Part 8):
+		// after operation resolution, parameter validation, and target
+		// normalization (all above); strictly before argv construction,
+		// lock acquisition, and process execution (all below). Applies to
+		// EVERY resolved, validated operation — read or mutating — not
+		// only mutating ones, since a future authorizer may legitimately
+		// deny read access too. CommandAdapter supplies only the already-
+		// validated $operation/$target/$normalizedActor to the seam; it
+		// evaluates no policy itself and asks no question beyond the one
+		// this call answers.
+		if (!$this->authorizer->authorize($operation, $target, $normalizedActor)) {
+			return $this->rejected(
+				$operation,
+				$entry["script"],
+				$commandId,
+				$startedAt,
+				$startedAtSeconds,
+				"AUTHORIZATION_DENIED",
+				sprintf("Actor is not authorized to perform '%s'", $operation),
+				$normalizedActor,
+				$target,
+				$entry["result_shape"] ?? null,
+				$rejectedMutationState
+			);
 		}
 
 		// Build argv strictly from the registry's declared argument_order.
@@ -382,16 +436,36 @@ final class CommandAdapter {
 			}
 		}
 
-		// mutation_state (WRITE_OPERATION_DESIGN.md Part 4): only ever set
-		// for mutating operations. "confirmed" trusts the same exit-0
-		// signal every existing direct exec() caller already trusts.
-		// "unknown" — never a more specific guess like "partial_failure" —
-		// is the deliberately non-committal answer for a non-zero exit;
-		// see AdapterResult::$mutationState's docblock and
-		// WRITE_OPERATION_DESIGN.md Part 5 for why.
+		// mutation_state (WRITE_OPERATION_DESIGN.md Part 4,
+		// MUTATION_AND_AUTHORIZATION_DESIGN.md Part 1): only ever set for
+		// mutating operations. "confirmed" trusts the same exit-0 signal
+		// every existing direct exec() caller already trusts.
+		//
+		// For a non-zero exit, "confirmed_degraded" is used ONLY when the
+		// resolved registry entry explicitly declares $hestiaErrorCode as
+		// one it has independently, source-verified as occurring strictly
+		// after this operation's core mutation is durably complete
+		// (mutation.known_post_mutation_exit_codes — see
+		// CommandRegistry::validateMutationMetadata()). This is a purely
+		// data-driven lookup against the resolved $entry — CommandAdapter
+		// itself contains no operation-specific exit code or error name
+		// (no "if ($hestiaErrorCode === 'E_RESTART')" anywhere in this
+		// file); a different registry entry declaring a different code,
+		// or none at all, changes this outcome without any code change
+		// here. Every other non-zero exit remains "unknown" — never a
+		// more specific guess like "partial_failure", and never a
+		// "definitely nothing changed" claim either (MUTATION_AND_AUTHORIZATION_DESIGN.md
+		// Part 1's asymmetric-risk reasoning for why no such state exists).
 		$mutationState = null;
 		if ($isMutating) {
-			$mutationState = $processResult->exitCode === 0 ? "confirmed" : "unknown";
+			if ($processResult->exitCode === 0) {
+				$mutationState = "confirmed";
+			} else {
+				$knownPostMutationCodes = $entry["mutation"]["known_post_mutation_exit_codes"] ?? [];
+				$mutationState = ($hestiaErrorCode !== null && in_array($hestiaErrorCode, $knownPostMutationCodes, true))
+					? "confirmed_degraded"
+					: "unknown";
+			}
 		}
 
 		return new AdapterResult(

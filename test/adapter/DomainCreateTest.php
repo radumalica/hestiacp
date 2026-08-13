@@ -79,6 +79,8 @@ final class DomainCreateTest {
 		$t->test("L. exit code/stdout/stderr are preserved on failure", [self::class, "testStreamsPreservedOnFailure"]);
 		$t->test("M. the lock is released after a successful execution", [self::class, "testLockReleasedAfterSuccess"]);
 		$t->test("N. the lock is released after Hestia returns an error", [self::class, "testLockReleasedAfterFailure"]);
+		$t->test("O. registry declares E_RESTART as a known post-mutation exit code", [self::class, "testRegistryDeclaresERestart"]);
+		$t->test("P. an E_RESTART failure after domain creation: status=hestia_error, mutation_state=confirmed_degraded", [self::class, "testRestartFailureIsConfirmedDegraded"]);
 	}
 
 	public static function testRegistered(): void {
@@ -270,5 +272,29 @@ final class DomainCreateTest {
 
 		assertEquals("hestia_error", $result->status, "status");
 		assertEquals(1, $lockManager->releaseCalls, "lock must be released even when bin/v-add-web-domain returns a non-zero exit code");
+	}
+
+	public static function testRegistryDeclaresERestart(): void {
+		$registry = new CommandRegistry();
+		$entry = $registry->get("domain.create");
+
+		assertEquals(["E_RESTART"], $entry["mutation"]["known_post_mutation_exit_codes"] ?? null, "domain.create must declare E_RESTART as a known post-mutation exit code (MUTATION_AND_AUTHORIZATION_DESIGN.md Part 2)");
+	}
+
+	public static function testRestartFailureIsConfirmedDegraded(): void {
+		// Exit code 20 (E_RESTART) — bin/v-add-web-domain's own restart
+		// step runs strictly after the domain's actual creation is
+		// already durably complete (confirmed by source read during
+		// DOMAIN_CREATE_IMPLEMENTATION.md), so an E_RESTART failure here
+		// must classify as confirmed_degraded, not unknown, now that the
+		// registry declares it.
+		$runner = new FakeProcessRunner(new ProcessResult(20, "", "Error: Restart failed"));
+		$adapter = self::buildAdapter($runner);
+
+		$result = $adapter->invoke("domain.create", ["user" => "admin", "domain" => "example.com"]);
+
+		assertEquals("hestia_error", $result->status, "status");
+		assertEquals("E_RESTART", $result->hestiaErrorCode, "exit code 20 must map to E_RESTART");
+		assertEquals("confirmed_degraded", $result->mutationState, "mutation_state must be 'confirmed_degraded': the registry declares E_RESTART as a known post-mutation exit code for domain.create, and the domain creation itself is, per source, already complete at this point");
 	}
 }

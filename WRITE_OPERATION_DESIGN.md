@@ -972,6 +972,18 @@ category.
 
 ## Result model
 
+> **Extended by `MUTATION_AND_AUTHORIZATION_DESIGN.md`.** A fourth
+> `mutation_state` value, `confirmed_degraded`, was added after two real
+> mutating operations (`domain.create`, `domain.delete`) both produced
+> concrete, source-verified evidence of a specific non-zero exit code
+> that is, per source, always post-mutation. It is populated only when a
+> registry entry explicitly declares that exit code as a known
+> post-mutation one (`mutation.known_post_mutation_exit_codes`); every
+> operation that doesn't declare anything still behaves exactly as
+> described below. See that document's "Implementation Note" for
+> details — the three-value model and its rationale below remain
+> accurate for everything this document originally covered.
+
 No new `status` values. One new field, `mutation_state` (`not_attempted` |
 `confirmed` | `unknown`), populated only for non-read operations, mapping
 directly onto the task's five required distinctions (Part 4's table).

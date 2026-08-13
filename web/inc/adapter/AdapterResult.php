@@ -91,28 +91,48 @@ final class AdapterResult {
 	public ?string $resultShape;
 
 	/**
-	 * @var string|null One of "not_attempted" | "confirmed" | "unknown",
-	 * populated only when the operation's registry entry declares
-	 * mutation.kind !== "read" (WRITE_OPERATION_DESIGN.md Part 4). Null
-	 * for read-only operations, where the question "did this mutate
-	 * anything" does not apply.
+	 * @var string|null One of "not_attempted" | "confirmed" |
+	 * "confirmed_degraded" | "unknown", populated only when the
+	 * operation's registry entry declares mutation.kind !== "read"
+	 * (WRITE_OPERATION_DESIGN.md Part 4, MUTATION_AND_AUTHORIZATION_DESIGN.md
+	 * Part 1). Null for read-only operations, where the question "did
+	 * this mutate anything" does not apply.
 	 *
-	 *   not_attempted — rejected before the underlying process was ever
-	 *                   spawned (unknown operation, validation failure,
-	 *                   LOCK_TIMEOUT, LOCK_UNAVAILABLE, ...). The adapter
-	 *                   KNOWS no mutation occurred, because nothing ran.
-	 *   confirmed     — the underlying process exited 0. Trusts the CLI's
-	 *                   own success signal, same as every existing direct
-	 *                   exec() caller already does.
-	 *   unknown       — the underlying process was spawned and exited
-	 *                   non-zero. This is the deliberately non-committal
-	 *                   answer: the adapter does NOT claim to know
-	 *                   whether zero, some, or all of the operation's
-	 *                   intended writes happened. See
-	 *                   WRITE_OPERATION_DESIGN.md Part 5's full trace of
-	 *                   bin/v-add-web-domain for why "unknown" — not a
-	 *                   more specific guess like "partial_failure" — is
-	 *                   the only honest answer for most write failures.
+	 *   not_attempted      — rejected before the underlying process was
+	 *                        ever spawned (unknown operation, validation
+	 *                        failure, AUTHORIZATION_DENIED, LOCK_TIMEOUT,
+	 *                        LOCK_UNAVAILABLE, ...). The adapter KNOWS no
+	 *                        mutation occurred, because nothing ran.
+	 *   confirmed          — the underlying process exited 0. Trusts the
+	 *                        CLI's own success signal, same as every
+	 *                        existing direct exec() caller already does.
+	 *   confirmed_degraded — the underlying process was spawned, exited
+	 *                        non-zero, AND the resolved registry entry
+	 *                        explicitly declares this exact exit code
+	 *                        (via mutation.known_post_mutation_exit_codes)
+	 *                        as one it has independently, source-verified
+	 *                        as occurring only after this operation's core
+	 *                        mutation is durably complete. A purely
+	 *                        data-driven classification — CommandAdapter
+	 *                        contains no hardcoded exit code or error name
+	 *                        to produce this value; see
+	 *                        MUTATION_AND_AUTHORIZATION_DESIGN.md Part 1-2.
+	 *   unknown            — the underlying process was spawned and
+	 *                        exited non-zero, and no such declaration
+	 *                        exists for this exit code. This remains the
+	 *                        deliberately non-committal default: the
+	 *                        adapter does NOT claim to know whether zero,
+	 *                        some, or all of the operation's intended
+	 *                        writes happened, and — per
+	 *                        MUTATION_AND_AUTHORIZATION_DESIGN.md Part 1's
+	 *                        asymmetric-risk reasoning — never claims the
+	 *                        opposite ("definitely did not mutate")
+	 *                        either, even for exit codes a human reading
+	 *                        the source could tell are pre-mutation. See
+	 *                        WRITE_OPERATION_DESIGN.md Part 5's full trace
+	 *                        of bin/v-add-web-domain for why "unknown" —
+	 *                        never a more specific guess like
+	 *                        "partial_failure" — is the safe default.
 	 */
 	public ?string $mutationState;
 

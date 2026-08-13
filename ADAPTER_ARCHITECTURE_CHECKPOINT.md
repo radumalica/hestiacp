@@ -380,14 +380,22 @@ being a trustworthy allowlist.*
 (not urgent for internal-only use, genuinely blocking for any
 external-facing exposure):
 
-1. **AuthZ, restated from Section 3**: nothing today stops an
-   authenticated `actor` from mutating a `target.user` that isn't
-   theirs. For an internal-only PHP caller this is equivalent to
-   today's direct-`exec()` reality (also unchecked) — not a regression.
-   For an external API, it is the single most important gap to close,
-   and it belongs in a layer above `CommandAdapter`, not inside it (the
-   adapter has no concept of "who is allowed to act as whom" and
-   shouldn't grow one — see Section 8).
+1. **AuthZ, restated from Section 3**: at the time this checkpoint was
+   written, nothing stopped an authenticated `actor` from mutating a
+   `target.user` that isn't theirs. **`MUTATION_AND_AUTHORIZATION_DESIGN.md`
+   has since implemented a structural authorization seam
+   (`AuthorizerInterface`, consulted on every resolved, validated
+   operation, strictly before locking/execution) — but its only
+   implementation today is `AllowAllAuthorizer`, so this gap remains
+   open in practice: the DECISION POINT now exists everywhere it needs
+   to, but no actual POLICY has been supplied yet.** For an internal-only
+   PHP caller this is still equivalent to today's direct-`exec()`
+   reality (also unchecked) — not a regression. For an external API, it
+   remains the single most important gap to close, and per that design
+   document it belongs in a layer above `CommandAdapter` (a real
+   `AuthorizerInterface` implementation), not inside it — the adapter
+   still has no concept of "who is allowed to act as whom" and still
+   shouldn't grow one (see Section 8).
 2. **The sudoers wildcard itself.** Narrowing
    `hestiaweb ALL=NOPASSWD:/usr/local/hestia/bin/*` to an explicit list
    matching `CommandRegistry`'s enumerated scripts (or at minimum a
@@ -555,8 +563,18 @@ requires of users.
 
 # 7. Result Semantics
 
-**The model**: `not_attempted` / `confirmed` / `unknown`, derived purely
-from (a) whether the process was ever spawned and (b) its exit code.
+> **Superseded by `MUTATION_AND_AUTHORIZATION_DESIGN.md`.** The
+> three-value model described in this section (as it stood at this
+> checkpoint) has since become four-valued — `confirmed_degraded` was
+> added, registry-driven via `mutation.known_post_mutation_exit_codes`.
+> The analysis below (walking through the task's six proposed
+> distinctions) reflects the state at the time this checkpoint was
+> written and is retained for that historical reasoning; see the newer
+> document's "Implementation Note" for the current model.
+
+**The model, as it stood at this checkpoint**: `not_attempted` /
+`confirmed` / `unknown`, derived purely from (a) whether the process was
+ever spawned and (b) its exit code.
 
 **Is this sufficient for API consumers, or does it need the richer
 6-way split the task poses** (validation failure / rejected before

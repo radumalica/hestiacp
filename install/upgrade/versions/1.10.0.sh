@@ -23,6 +23,17 @@ upgrade_config_set_value 'UPGRADE_UPDATE_FILEMANAGER_CONFIG' 'false'
 upgrade_config_set_value 'UPGRADE_UPDATE_MAIL_TEMPLATES' 'true'
 upgrade_config_set_value 'UPGRADE_REBUILD_USERS' 'false'
 
+# Create $HESTIA/data/api-credentials for API v2 credential provisioning
+# (web/inc/auth/AccessKeyProvisioner.php, web/inc/auth/AccessKeyValidator.php)
+# on installations that predate it. Mirrors how $HESTIA/data/sessions was
+# retroactively chown'd in 1.9.0.sh/1.9.2.sh — root:hestiaweb + setgid
+# (2750), not hestiaweb:hestiaweb, since this directory must stay
+# root-only to WRITE; see CREDENTIAL_PROVISIONING_WIRING_DESIGN.md §2.1.
+echo "[ * ] Creating API v2 credential directory"
+mkdir -p "$HESTIA/data/api-credentials"
+chown root:hestiaweb "$HESTIA/data/api-credentials"
+chmod 2750 "$HESTIA/data/api-credentials"
+
 # fix/file manager ignores user language
 echo "[ * ] Fix File Manager ignoring user language"
 cp -f "$HESTIA"/install/deb/filemanager/filegator/configuration.php "$HESTIA"/web/fm/configuration.php

@@ -83,4 +83,110 @@ final class ParameterValidator {
 		}
 		return true;
 	}
+
+	/**
+	 * Approximates func/main.sh is_database_format_valid() (func/main.sh
+	 * 1206-1212):
+	 *   - rejects the fixed set of shell/format-hostile characters
+	 *     Hestia's own exclude class lists: ! | @ # $ ^ & * ( ) + = { }
+	 *     : , < > ? / \ " ' ; % ` and space
+	 *   - rejects strings 64 characters or longer
+	 *   - rejects embedded newlines (is_no_new_line_format)
+	 *
+	 * Deliberately does NOT add an ASCII-only restriction the way
+	 * isValidUsername() does — Hestia's own bash regex here only excludes
+	 * the specific punctuation class above, not non-ASCII bytes in
+	 * general, so adding one would be inventing a restriction the source
+	 * does not have.
+	 *
+	 * One deliberate approximation, documented rather than silently
+	 * assumed: this validates the RAW, caller-supplied suffix (e.g.
+	 * "wordpress_db"), but bin/v-add-database's own 64-character check
+	 * (func/main.sh:1208, `[ 64 -le ${#1} ]`) runs against the
+	 * user-prefixed value it builds internally (`database="$user"_"$2"`,
+	 * bin/v-add-database:21) — i.e. against a longer string than this
+	 * validator ever sees. This validator is therefore intentionally a
+	 * LOOSER bound than the script's own real limit, never a tighter
+	 * one — the script itself remains the sole authoritative check for
+	 * the true, prefixed length, exactly as this class's own philosophy
+	 * (shape-only, never business-authoritative) already requires.
+	 *
+	 * Does NOT check whether the database already exists for the user —
+	 * that is is_object_new('db', 'DB', ...) inside v-add-database
+	 * itself, and stays there.
+	 */
+	public static function isValidDatabaseName($value): bool {
+		if (!is_string($value) || $value === "") {
+			return false;
+		}
+		if (strlen($value) >= 64) {
+			return false;
+		}
+		if (preg_match('/[!|@#$^&*()+={}:,<>?\/\\\\"\'`;%\s]/', $value)) {
+			return false;
+		}
+		return true;
+	}
+
+	/**
+	 * Approximates func/main.sh is_dbuser_format_valid() (func/main.sh
+	 * 1222-1231):
+	 *   - rejects strings 33 characters or longer ("mysql username can be
+	 *     up to 32 characters long")
+	 *   - rejects the SAME exclude character class isValidDatabaseName()
+	 *     uses (func/main.sh reuses the identical `$exclude` variable for
+	 *     both functions)
+	 *   - rejects embedded newlines (is_no_new_line_format)
+	 *
+	 * Same raw-suffix-vs-prefixed-value approximation as
+	 * isValidDatabaseName() above applies here too
+	 * (`dbuser="$user"_"$3"`, bin/v-add-database:22) — this validator's
+	 * 32-character bound is checked against the shorter, unprefixed
+	 * value, so it is a looser bound than the script's own real limit on
+	 * the concatenated value, never a tighter one.
+	 *
+	 * Does NOT check whether the dbuser already exists for the user —
+	 * that is is_object_new('db', 'DBUSER', ...) inside v-add-database
+	 * itself, and stays there.
+	 */
+	public static function isValidDatabaseUsername($value): bool {
+		if (!is_string($value) || $value === "") {
+			return false;
+		}
+		if (strlen($value) >= 33) {
+			return false;
+		}
+		if (preg_match('/[!|@#$^&*()+={}:,<>?\/\\\\"\'`;%\s]/', $value)) {
+			return false;
+		}
+		return true;
+	}
+
+	/**
+	 * The loosest possible shape check for an opaque secret value —
+	 * deliberately, because bin/v-add-database applies NO format
+	 * validation to its DBPASS argument at all: is_format_valid() is
+	 * called there as `is_format_valid 'user' 'database' 'dbuser'
+	 * 'charset'` (bin/v-add-database:50) — 'dbpass' is conspicuously
+	 * absent from that list, and the only other function that touches
+	 * the password (is_password_valid(), func/main.sh:625-633) performs
+	 * a temp-file-dereference, never a character/length check. Adding
+	 * any restriction beyond "is a non-empty string" here would be
+	 * inventing a business rule the source does not have — real
+	 * passwords legitimately contain any character.
+	 *
+	 * The one restriction this does apply — rejecting an empty string —
+	 * matches this class's own existing convention (isValidUsername()
+	 * and isValidDomain() both already reject "" as their very first
+	 * check) rather than a source-verified Hestia rule: Hestia's own
+	 * check_args() only validates argument COUNT, not whether an
+	 * individual argument is non-empty, so a truly empty password string
+	 * would technically reach bin/v-add-database unblocked. This
+	 * validator deliberately narrows that one case, consistent with the
+	 * existing validators in this file, not consistent with a literal
+	 * reading of the shell source.
+	 */
+	public static function isValidSecret($value): bool {
+		return is_string($value) && $value !== "";
+	}
 }

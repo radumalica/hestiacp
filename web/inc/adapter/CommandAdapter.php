@@ -59,6 +59,57 @@ final class CommandAdapter {
 	private array $typeValidators;
 
 	/**
+	 * The only supported value for a parameter's "delivery" metadata
+	 * (SENSITIVE_PARAMETER_DESIGN.md). A parameter marked
+	 * "delivery" => "temp_file" has its value written to a securely
+	 * created, 0600, unpredictably-named file instead of being placed
+	 * directly into argv; the FILE PATH is what actually reaches the
+	 * child process. Mirrors a temp-file delivery convention already used
+	 * elsewhere in this codebase for a sensitive CLI argument
+	 * (SENSITIVE_PARAMETER_DESIGN.md "why temp-file delivery is used") —
+	 * this adapter does not invent a new convention, it generalizes an
+	 * existing one. This class deliberately names no specific operation,
+	 * script, or parameter anywhere in its own source — see
+	 * SENSITIVE_PARAMETER_DESIGN.md "why this is generic".
+	 *
+	 * Public (not private), same reasoning as HESTIA_EXIT_CODES below:
+	 * CommandRegistry::validateParameterMetadata() validates every
+	 * declared "delivery" value against this SAME table at construction
+	 * time, so a typo'd delivery mode fails loudly rather than silently
+	 * falling back to placing a value in argv unprotected.
+	 *
+	 * @var string[]
+	 */
+	public const SUPPORTED_DELIVERY_MODES = ["temp_file"];
+
+	private const DELIVERY_TEMP_FILE = "temp_file";
+
+	/**
+	 * Prefix for every secure temp file this class creates
+	 * (SENSITIVE_PARAMETER_DESIGN.md "execution lifecycle"). Kept short
+	 * and adapter-generic — never operation-specific — since the same
+	 * mechanism serves any future sensitive, temp-file-delivered
+	 * parameter, whatever operation eventually declares one.
+	 */
+	private const TEMP_FILE_PREFIX = "hstadapter";
+
+	/**
+	 * Fixed, literal directory every secure temp file is created under —
+	 * deliberately NOT sys_get_temp_dir() (SENSITIVE_PARAMETER_REVIEW.md
+	 * finding F-2: sys_get_temp_dir() resolves dynamically, honoring a
+	 * TMPDIR environment override, which could silently diverge from the
+	 * literal "/tmp/" prefix an existing, already-established convention
+	 * for this exact problem elsewhere in this codebase requires — see
+	 * SENSITIVE_PARAMETER_DESIGN.md "security requirements" for the full
+	 * source-verified trace of that requirement). Deliberately not
+	 * configurable — this generic mechanism has exactly one concrete
+	 * contract it was built to satisfy, and that contract is a literal
+	 * path prefix, not "wherever this host's temp directory happens to
+	 * be."
+	 */
+	private const TEMP_FILE_DIRECTORY = "/tmp";
+
+	/**
 	 * Mirrors func/main.sh's E_* exit code constants (func/main.sh lines
 	 * 109-129) by name, so a caller sees "E_NOTEXIST" rather than a bare
 	 * "3" that means nothing without cross-referencing the shell source.
@@ -116,9 +167,14 @@ final class CommandAdapter {
 		$this->lockManager = $lockManager ?? new LockManager();
 		// Never conditional on "was an authorizer supplied" — the seam is
 		// ALWAYS consulted (see invoke()); only the default POLICY behind
-		// it is permissive. See AllowAllAuthorizer's own docblock and
-		// MUTATION_AND_AUTHORIZATION_DESIGN.md Part 7.
-		$this->authorizer = $authorizer ?? new AllowAllAuthorizer();
+		// it matters. The default is SameUserAuthorizer, a real (not
+		// permissive) policy — see AUTHORIZATION_POLICY_IMPLEMENTATION.md.
+		// No production code constructs CommandAdapter today (this
+		// parameter default is therefore the only "default wiring" that
+		// concretely exists); callers that genuinely need permissive
+		// behavior (tests exercising unrelated concerns) must inject
+		// AllowAllAuthorizer explicitly rather than rely on omission.
+		$this->authorizer = $authorizer ?? new SameUserAuthorizer();
 		$this->clock = $clock ?? static function (): float {
 			return microtime(true);
 		};
@@ -129,6 +185,9 @@ final class CommandAdapter {
 		$this->typeValidators = [
 			"username" => [ParameterValidator::class, "isValidUsername"],
 			"domain" => [ParameterValidator::class, "isValidDomain"],
+			"database_name" => [ParameterValidator::class, "isValidDatabaseName"],
+			"db_username" => [ParameterValidator::class, "isValidDatabaseUsername"],
+			"secret" => [ParameterValidator::class, "isValidSecret"],
 		];
 	}
 
@@ -259,7 +318,31 @@ final class CommandAdapter {
 				);
 			}
 
-			$target[$name] = $value;
+			// SENSITIVE_PARAMETER_DESIGN.md: a parameter declared
+			// "sensitive" => true is validated exactly like any other
+			// parameter above, and remains available below for argv
+			// construction via $params — but it is deliberately never
+			// copied into $target. $target is what reaches
+			// AuthorizerInterface::authorize() (below) and every
+			// AdapterResult this method returns (including every
+			// rejection from this point on), so this is the one
+			// generic choke point that keeps a sensitive value out of
+			// both. No other place in this method reads $params
+			// directly for anything other than argv construction.
+			//
+			// Strict identity comparison (=== true), not loose
+			// truthiness — deliberately, per SENSITIVE_PARAMETER_REVIEW.md
+			// finding F-1: this field gates a security property, and
+			// CommandRegistry::validateParameterMetadata() now rejects
+			// any "sensitive" value that is not an actual PHP boolean (or
+			// absent/null, treated as false) at construction time, so by
+			// the time this line runs, $definition["sensitive"] can only
+			// ever be true, false, null, or absent — matching this
+			// comparison's own strictness exactly, on both sides, so the
+			// two checks can no longer disagree about a malformed value.
+			if (($definition["sensitive"] ?? false) !== true) {
+				$target[$name] = $value;
+			}
 		}
 
 		// Authorization (MUTATION_AND_AUTHORIZATION_DESIGN.md Part 8):
@@ -294,200 +377,317 @@ final class CommandAdapter {
 		// source, and never assembled into a shell string. See
 		// ProcOpenProcessRunner for why array-form argv, not string
 		// concatenation, is what actually prevents injection here.
+		//
+		// A parameter declared "delivery" => "temp_file"
+		// (SENSITIVE_PARAMETER_DESIGN.md) does NOT have its value placed
+		// into argv directly: it is written to a securely created temp
+		// file, and the FILE PATH becomes the argv entry instead. This is
+		// deliberately positioned here — after authorization (above) has
+		// already succeeded, and only once we know we are actually about
+		// to attempt a lock/execution — so no temp file is ever created
+		// for a request authorization would go on to deny.
+		//
+		// $temporaryFiles collects every path created below so the
+		// outer try/finally can guarantee cleanup on every exit from this
+		// point on: successful execution, a non-zero exit, a lock
+		// failure, a registry-authoring error, or an exception escaping
+		// $this->runner->run() — see SENSITIVE_PARAMETER_DESIGN.md
+		// "cleanup guarantees".
 		$fixedParameters = $entry["fixed_parameters"] ?? [];
 		$argv = [];
-		foreach ($entry["argument_order"] as $argName) {
-			if (array_key_exists($argName, $fixedParameters)) {
-				$argv[] = (string) $fixedParameters[$argName];
-			} elseif (array_key_exists($argName, $params)) {
-				$argv[] = (string) $params[$argName];
-			} else {
-				// argument_order referenced a name with neither a
-				// supplied value nor a fixed value — a registry
-				// authoring bug, not a caller error. Fail closed.
-				return $this->rejected(
-					$operation,
-					$entry["script"],
-					$commandId,
-					$startedAt,
-					$startedAtSeconds,
-					"REGISTRY_ERROR",
-					"Registry entry for '" . $operation . "' references undefined argument: " . $argName,
-					$normalizedActor,
-					$target,
-					$entry["result_shape"] ?? null,
-					$rejectedMutationState
-				);
-			}
-		}
+		$temporaryFiles = [];
 
-		// Lock acquisition happens here: after every validation step above
-		// (so contention is never incurred for a request that was going to
-		// be rejected anyway — WRITE_OPERATION_DESIGN.md Part 3's ordering
-		// requirement), and strictly before the underlying process is
-		// spawned (so a lock timeout guarantees the v-* command never
-		// runs — Part 3's "timeout must not execute the command").
-		//
-		// Locked on $target["user"], not on any raw $params value: by this
-		// point "user" has already passed ParameterValidator::isValidUsername()
-		// for every registered operation that declares a "user" parameter
-		// (both existing operations, and any mutating operation a future
-		// registry entry adds), so LockManager's own independent
-		// revalidation (LockManager::lockFilePath()) is defense-in-depth,
-		// not the only check.
-		$lockAcquired = false;
-		if ($isMutating) {
-			$lockUser = $target["user"] ?? null;
-			if ($lockUser === null) {
-				// A mutating registry entry without a "user" parameter is a
-				// registry authoring bug — there is nothing to lock on.
-				// Fail closed rather than run a mutating command with no
-				// serialization at all.
-				return $this->rejected(
-					$operation,
-					$entry["script"],
-					$commandId,
-					$startedAt,
-					$startedAtSeconds,
-					"REGISTRY_ERROR",
-					"Mutating operation '" . $operation . "' has no 'user' parameter to lock on",
-					$normalizedActor,
-					$target,
-					$entry["result_shape"] ?? null,
-					$rejectedMutationState
-				);
+		try {
+			foreach ($entry["argument_order"] as $argName) {
+				if (array_key_exists($argName, $fixedParameters)) {
+					$rawValue = (string) $fixedParameters[$argName];
+				} elseif (array_key_exists($argName, $params)) {
+					$rawValue = (string) $params[$argName];
+				} else {
+					// argument_order referenced a name with neither a
+					// supplied value nor a fixed value — a registry
+					// authoring bug, not a caller error. Fail closed.
+					return $this->rejected(
+						$operation,
+						$entry["script"],
+						$commandId,
+						$startedAt,
+						$startedAtSeconds,
+						"REGISTRY_ERROR",
+						"Registry entry for '" . $operation . "' references undefined argument: " . $argName,
+						$normalizedActor,
+						$target,
+						$entry["result_shape"] ?? null,
+						$rejectedMutationState
+					);
+				}
+
+				$delivery = $parameterSchema[$argName]["delivery"] ?? null;
+				if ($delivery === self::DELIVERY_TEMP_FILE) {
+					try {
+						$tempPath = $this->writeSecureTempFile($rawValue);
+					} catch (\RuntimeException $exception) {
+						return $this->rejected(
+							$operation,
+							$entry["script"],
+							$commandId,
+							$startedAt,
+							$startedAtSeconds,
+							"TEMP_FILE_UNAVAILABLE",
+							"Unable to prepare secure parameter delivery for '" . $argName . "': " . $exception->getMessage(),
+							$normalizedActor,
+							$target,
+							$entry["result_shape"] ?? null,
+							$rejectedMutationState
+						);
+					}
+					$temporaryFiles[] = $tempPath;
+					$argv[] = $tempPath;
+				} else {
+					$argv[] = $rawValue;
+				}
+			}
+
+			// Lock acquisition happens here: after every validation step
+			// above (so contention is never incurred for a request that
+			// was going to be rejected anyway — WRITE_OPERATION_DESIGN.md
+			// Part 3's ordering requirement), and strictly before the
+			// underlying process is spawned (so a lock timeout guarantees
+			// the v-* command never runs — Part 3's "timeout must not
+			// execute the command").
+			//
+			// Locked on $target["user"], not on any raw $params value: by
+			// this point "user" has already passed
+			// ParameterValidator::isValidUsername() for every registered
+			// operation that declares a "user" parameter (both existing
+			// operations, and any mutating operation a future registry
+			// entry adds), so LockManager's own independent revalidation
+			// (LockManager::lockFilePath()) is defense-in-depth, not the
+			// only check.
+			$lockAcquired = false;
+			if ($isMutating) {
+				$lockUser = $target["user"] ?? null;
+				if ($lockUser === null) {
+					// A mutating registry entry without a "user" parameter is a
+					// registry authoring bug — there is nothing to lock on.
+					// Fail closed rather than run a mutating command with no
+					// serialization at all.
+					return $this->rejected(
+						$operation,
+						$entry["script"],
+						$commandId,
+						$startedAt,
+						$startedAtSeconds,
+						"REGISTRY_ERROR",
+						"Mutating operation '" . $operation . "' has no 'user' parameter to lock on",
+						$normalizedActor,
+						$target,
+						$entry["result_shape"] ?? null,
+						$rejectedMutationState
+					);
+				}
+
+				try {
+					$lockAcquired = $this->lockManager->acquire($lockUser);
+				} catch (LockUnavailableException $exception) {
+					return $this->rejected(
+						$operation,
+						$entry["script"],
+						$commandId,
+						$startedAt,
+						$startedAtSeconds,
+						"LOCK_UNAVAILABLE",
+						"Locking mechanism unavailable: " . $exception->getMessage(),
+						$normalizedActor,
+						$target,
+						$entry["result_shape"] ?? null,
+						$rejectedMutationState
+					);
+				}
+
+				if (!$lockAcquired) {
+					return $this->rejected(
+						$operation,
+						$entry["script"],
+						$commandId,
+						$startedAt,
+						$startedAtSeconds,
+						"LOCK_TIMEOUT",
+						"Timed out waiting for the per-user lock for: " . $lockUser,
+						$normalizedActor,
+						$target,
+						$entry["result_shape"] ?? null,
+						$rejectedMutationState
+					);
+				}
 			}
 
 			try {
-				$lockAcquired = $this->lockManager->acquire($lockUser);
-			} catch (LockUnavailableException $exception) {
-				return $this->rejected(
-					$operation,
-					$entry["script"],
-					$commandId,
-					$startedAt,
-					$startedAtSeconds,
-					"LOCK_UNAVAILABLE",
-					"Locking mechanism unavailable: " . $exception->getMessage(),
-					$normalizedActor,
-					$target,
-					$entry["result_shape"] ?? null,
-					$rejectedMutationState
-				);
+				$scriptPath = $this->binDir . $entry["script"];
+				$processResult = $this->runner->run($this->sudoBinary, array_merge([$scriptPath], $argv));
+			} finally {
+				// Always released, including when $this->runner->run() throws
+				// (CommandAdapter does not swallow that exception — it
+				// propagates to the caller unchanged, per this class's
+				// existing "every EXPECTED failure is an AdapterResult, not an
+				// exception" contract; only the lock itself is guaranteed not
+				// to leak). Idempotent / safe to call when nothing was
+				// acquired (LockManager::release()).
+				if ($lockAcquired) {
+					$this->lockManager->release();
+				}
 			}
 
-			if (!$lockAcquired) {
-				return $this->rejected(
-					$operation,
-					$entry["script"],
-					$commandId,
-					$startedAt,
-					$startedAtSeconds,
-					"LOCK_TIMEOUT",
-					"Timed out waiting for the per-user lock for: " . $lockUser,
-					$normalizedActor,
-					$target,
-					$entry["result_shape"] ?? null,
-					$rejectedMutationState
-				);
+			$finishedAtSeconds = ($this->clock)();
+			$finishedAt = $this->formatTimestamp($finishedAtSeconds);
+			$durationMs = (int) round(($finishedAtSeconds - $startedAtSeconds) * 1000);
+
+			$parsedOutput = null;
+			if (($entry["output_format"] ?? null) === "json" && trim($processResult->stdout) !== "") {
+				$decoded = json_decode($processResult->stdout, true);
+				if (json_last_error() === JSON_ERROR_NONE) {
+					$parsedOutput = $decoded;
+				}
 			}
-		}
 
-		try {
-			$scriptPath = $this->binDir . $entry["script"];
-			$processResult = $this->runner->run($this->sudoBinary, array_merge([$scriptPath], $argv));
-		} finally {
-			// Always released, including when $this->runner->run() throws
-			// (CommandAdapter does not swallow that exception — it
-			// propagates to the caller unchanged, per this class's
-			// existing "every EXPECTED failure is an AdapterResult, not an
-			// exception" contract; only the lock itself is guaranteed not
-			// to leak). Idempotent / safe to call when nothing was
-			// acquired (LockManager::release()).
-			if ($lockAcquired) {
-				$this->lockManager->release();
-			}
-		}
-
-		$finishedAtSeconds = ($this->clock)();
-		$finishedAt = $this->formatTimestamp($finishedAtSeconds);
-		$durationMs = (int) round(($finishedAtSeconds - $startedAtSeconds) * 1000);
-
-		$parsedOutput = null;
-		if (($entry["output_format"] ?? null) === "json" && trim($processResult->stdout) !== "") {
-			$decoded = json_decode($processResult->stdout, true);
-			if (json_last_error() === JSON_ERROR_NONE) {
-				$parsedOutput = $decoded;
-			}
-		}
-
-		if ($processResult->exitCode === 0) {
-			$status = "ok";
-			$hestiaErrorCode = null;
-			$errorMessage = null;
-		} else {
-			$status = "hestia_error";
-			$hestiaErrorCode = self::HESTIA_EXIT_CODES[$processResult->exitCode] ?? null;
-			$errorMessage = trim($processResult->stderr) !== ""
-				? trim($processResult->stderr)
-				: trim($processResult->stdout);
-			if ($errorMessage === "") {
-				$errorMessage = sprintf("Command exited with code %d", $processResult->exitCode);
-			}
-		}
-
-		// mutation_state (WRITE_OPERATION_DESIGN.md Part 4,
-		// MUTATION_AND_AUTHORIZATION_DESIGN.md Part 1): only ever set for
-		// mutating operations. "confirmed" trusts the same exit-0 signal
-		// every existing direct exec() caller already trusts.
-		//
-		// For a non-zero exit, "confirmed_degraded" is used ONLY when the
-		// resolved registry entry explicitly declares $hestiaErrorCode as
-		// one it has independently, source-verified as occurring strictly
-		// after this operation's core mutation is durably complete
-		// (mutation.known_post_mutation_exit_codes — see
-		// CommandRegistry::validateMutationMetadata()). This is a purely
-		// data-driven lookup against the resolved $entry — CommandAdapter
-		// itself contains no operation-specific exit code or error name
-		// (no "if ($hestiaErrorCode === 'E_RESTART')" anywhere in this
-		// file); a different registry entry declaring a different code,
-		// or none at all, changes this outcome without any code change
-		// here. Every other non-zero exit remains "unknown" — never a
-		// more specific guess like "partial_failure", and never a
-		// "definitely nothing changed" claim either (MUTATION_AND_AUTHORIZATION_DESIGN.md
-		// Part 1's asymmetric-risk reasoning for why no such state exists).
-		$mutationState = null;
-		if ($isMutating) {
 			if ($processResult->exitCode === 0) {
-				$mutationState = "confirmed";
+				$status = "ok";
+				$hestiaErrorCode = null;
+				$errorMessage = null;
 			} else {
-				$knownPostMutationCodes = $entry["mutation"]["known_post_mutation_exit_codes"] ?? [];
-				$mutationState = ($hestiaErrorCode !== null && in_array($hestiaErrorCode, $knownPostMutationCodes, true))
-					? "confirmed_degraded"
-					: "unknown";
+				$status = "hestia_error";
+				$hestiaErrorCode = self::HESTIA_EXIT_CODES[$processResult->exitCode] ?? null;
+				$errorMessage = trim($processResult->stderr) !== ""
+					? trim($processResult->stderr)
+					: trim($processResult->stdout);
+				if ($errorMessage === "") {
+					$errorMessage = sprintf("Command exited with code %d", $processResult->exitCode);
+				}
+			}
+
+			// mutation_state (WRITE_OPERATION_DESIGN.md Part 4,
+			// MUTATION_AND_AUTHORIZATION_DESIGN.md Part 1): only ever set for
+			// mutating operations. "confirmed" trusts the same exit-0 signal
+			// every existing direct exec() caller already trusts.
+			//
+			// For a non-zero exit, "confirmed_degraded" is used ONLY when the
+			// resolved registry entry explicitly declares $hestiaErrorCode as
+			// one it has independently, source-verified as occurring strictly
+			// after this operation's core mutation is durably complete
+			// (mutation.known_post_mutation_exit_codes — see
+			// CommandRegistry::validateMutationMetadata()). This is a purely
+			// data-driven lookup against the resolved $entry — CommandAdapter
+			// itself contains no operation-specific exit code or error name
+			// (no "if ($hestiaErrorCode === 'E_RESTART')" anywhere in this
+			// file); a different registry entry declaring a different code,
+			// or none at all, changes this outcome without any code change
+			// here. Every other non-zero exit remains "unknown" — never a
+			// more specific guess like "partial_failure", and never a
+			// "definitely nothing changed" claim either (MUTATION_AND_AUTHORIZATION_DESIGN.md
+			// Part 1's asymmetric-risk reasoning for why no such state exists).
+			$mutationState = null;
+			if ($isMutating) {
+				if ($processResult->exitCode === 0) {
+					$mutationState = "confirmed";
+				} else {
+					$knownPostMutationCodes = $entry["mutation"]["known_post_mutation_exit_codes"] ?? [];
+					$mutationState = ($hestiaErrorCode !== null && in_array($hestiaErrorCode, $knownPostMutationCodes, true))
+						? "confirmed_degraded"
+						: "unknown";
+				}
+			}
+
+			return new AdapterResult(
+				$operation,
+				$entry["script"],
+				$commandId,
+				$status,
+				$processResult->exitCode,
+				$hestiaErrorCode,
+				null,
+				$errorMessage,
+				$processResult->stdout,
+				$processResult->stderr,
+				$parsedOutput,
+				$startedAt,
+				$finishedAt,
+				$durationMs,
+				$normalizedActor,
+				$target,
+				$entry["result_shape"] ?? null,
+				$mutationState
+			);
+		} finally {
+			// Runs on every exit from the try block above: the normal
+			// return, every early "return $this->rejected(...)" (registry
+			// error, lock unavailable, lock timeout), and any exception
+			// propagating out of $this->runner->run(). See
+			// SENSITIVE_PARAMETER_DESIGN.md "cleanup guarantees".
+			foreach ($temporaryFiles as $tempPath) {
+				$this->removeSecureTempFile($tempPath);
 			}
 		}
+	}
 
-		return new AdapterResult(
-			$operation,
-			$entry["script"],
-			$commandId,
-			$status,
-			$processResult->exitCode,
-			$hestiaErrorCode,
-			null,
-			$errorMessage,
-			$processResult->stdout,
-			$processResult->stderr,
-			$parsedOutput,
-			$startedAt,
-			$finishedAt,
-			$durationMs,
-			$normalizedActor,
-			$target,
-			$entry["result_shape"] ?? null,
-			$mutationState
-		);
+	/**
+	 * Writes $value to a newly created, securely permissioned,
+	 * unpredictably named temp file and returns its path.
+	 * SENSITIVE_PARAMETER_DESIGN.md "execution lifecycle" /
+	 * "security requirements".
+	 *
+	 * Uses the fixed, literal self::TEMP_FILE_DIRECTORY ("/tmp") rather
+	 * than a dedicated adapter directory or the dynamically-resolved
+	 * system temp directory — deliberately mirroring an existing,
+	 * already-established production convention for this exact problem
+	 * elsewhere in this codebase, not inventing a second one, and
+	 * deliberately deterministic rather than environment-dependent (see
+	 * self::TEMP_FILE_DIRECTORY's own docblock). This also keeps the
+	 * mechanism compatible with any future script whose own
+	 * value-from-file support is scoped to a "/tmp/" prefix, without
+	 * CommandAdapter needing to know that fact about any specific script
+	 * — it always uses this same directory, generically. See
+	 * SENSITIVE_PARAMETER_DESIGN.md "security requirements" for the full
+	 * source-verified rationale.
+	 *
+	 * tempnam() creates the file atomically with mode 0600 already; the
+	 * explicit chmod() below is defense-in-depth, not the only guarantee.
+	 * A trailing newline is appended to match the existing convention
+	 * documented in SENSITIVE_PARAMETER_DESIGN.md "security requirements"
+	 * (verified against the actual reader, not assumed).
+	 *
+	 * @throws \RuntimeException if a secure temp file could not be created or written.
+	 */
+	private function writeSecureTempFile(string $value): string {
+		error_clear_last();
+		$path = @tempnam(self::TEMP_FILE_DIRECTORY, self::TEMP_FILE_PREFIX);
+		if ($path === false) {
+			$lastError = error_get_last();
+			throw new \RuntimeException(
+				"Unable to create a secure temporary file: " . ($lastError["message"] ?? "unknown error")
+			);
+		}
+
+		@chmod($path, 0600);
+
+		$written = @file_put_contents($path, $value . "\n");
+		if ($written === false) {
+			@unlink($path);
+			throw new \RuntimeException("Unable to write to secure temporary file: " . $path);
+		}
+
+		return $path;
+	}
+
+	/**
+	 * Best-effort, idempotent removal of a temp file created by
+	 * writeSecureTempFile(). Never throws — cleanup must not itself
+	 * become a new failure mode on an already-completed or already-failed
+	 * invocation. SENSITIVE_PARAMETER_DESIGN.md "cleanup guarantees".
+	 */
+	private function removeSecureTempFile(string $path): void {
+		if (is_file($path)) {
+			@unlink($path);
+		}
 	}
 
 	private function rejected(

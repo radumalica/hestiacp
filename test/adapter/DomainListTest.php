@@ -33,7 +33,9 @@ final class DomainListTest {
 			},
 			static function (): string {
 				return "fixed-test-id";
-			}
+			},
+			null,
+			new \Hestiacp\Adapter\AllowAllAuthorizer()
 		);
 	}
 

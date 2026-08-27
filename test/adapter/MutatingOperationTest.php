@@ -63,7 +63,8 @@ final class MutatingOperationTest {
 			static function (): string {
 				return "fixed-test-id";
 			},
-			$lockManager
+			$lockManager,
+			new \Hestiacp\Adapter\AllowAllAuthorizer()
 		);
 	}
 

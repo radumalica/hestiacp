@@ -29,7 +29,9 @@ final class CommandAdapterTest {
 			},
 			$idGen ?? static function (): string {
 				return "fixed-test-id";
-			}
+			},
+			null,
+			new \Hestiacp\Adapter\AllowAllAuthorizer()
 		);
 	}
 

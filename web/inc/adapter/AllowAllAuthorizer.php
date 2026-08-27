@@ -3,21 +3,18 @@
 namespace Hestiacp\Adapter;
 
 /**
- * Default, fully-permissive AuthorizerInterface implementation.
+ * Fully-permissive AuthorizerInterface implementation. TEST / DEVELOPMENT
+ * POLICY ONLY — this must never be the production default.
  *
- * This is what preserves CommandAdapter's existing, fully-trusted
- * internal-caller behavior with ZERO change: every request is allowed,
- * exactly as if no authorization seam existed at all. Per
- * MUTATION_AND_AUTHORIZATION_DESIGN.md Part 7, CommandAdapter's
- * constructor defaults to this implementation rather than making the
- * authorization call conditional on an authorizer being present — the
- * seam is ALWAYS consulted (see CommandAdapter::invoke()); only the
- * POLICY behind it is permissive by default.
+ * Every request is allowed, exactly as if no authorization seam existed
+ * at all. As of AUTHORIZATION_POLICY_IMPLEMENTATION.md, CommandAdapter's
+ * constructor no longer defaults to this class — it defaults to
+ * SameUserAuthorizer, a real policy. This class remains only so that
+ * tests exercising concerns other than authorization (validation, argv
+ * construction, locking, mutation classification, etc.) can explicitly
+ * inject permissive behavior instead of relying on omission.
  *
- * A future API v2 service layer is expected to inject a real,
- * policy-checking AuthorizerInterface implementation instead of this
- * one — this class is not meant to ever be used once a non-trusted
- * caller exists.
+ * Do not construct this in any code path a non-trusted caller can reach.
  */
 final class AllowAllAuthorizer implements AuthorizerInterface {
 	public function authorize(string $operation, array $target, array $actor): bool {

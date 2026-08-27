@@ -1351,7 +1351,7 @@ ln -s /var/log/hestia $HESTIA/log
 # Building directory tree and creating some blank files for Hestia
 mkdir -p $HESTIA/conf $HESTIA/ssl $HESTIA/data/ips \
 	$HESTIA/data/queue $HESTIA/data/users $HESTIA/data/firewall \
-	$HESTIA/data/sessions $HESTIA/data/adapter-locks
+	$HESTIA/data/sessions $HESTIA/data/adapter-locks $HESTIA/data/api-credentials
 touch $HESTIA/data/queue/backup.pipe $HESTIA/data/queue/disk.pipe \
 	$HESTIA/data/queue/webstats.pipe $HESTIA/data/queue/restart.pipe \
 	$HESTIA/data/queue/traffic.pipe $HESTIA/data/queue/daily.pipe $HESTIA/log/system.log \
@@ -1366,6 +1366,18 @@ chmod 770 $HESTIA/data/sessions
 # hestiaweb:hestiaweb below, once the hestiaweb user exists, mirroring the
 # existing $HESTIA/data/sessions convention (see LOCK_PERMISSION_REVIEW.md).
 chmod 770 $HESTIA/data/adapter-locks
+# $HESTIA/data/api-credentials holds hashed API v2 credential records
+# (web/inc/auth/AccessKeyProvisioner.php, web/inc/auth/AccessKeyValidator.php).
+# Unlike adapter-locks/sessions, this directory is intentionally root-only
+# to WRITE (only v-add-api-credential/v-delete-api-credential, run as
+# root, may create or remove a credential) while still being readable by
+# hestiaweb (which validates credentials directly, with no sudo/bin/v-*
+# intermediary). Ownership set to root:hestiaweb below, once the
+# hestiaweb group exists; the setgid bit (2750) makes every credential
+# file this directory ever holds inherit group "hestiaweb" automatically,
+# regardless of which identity created it — see
+# CREDENTIAL_PROVISIONING_WIRING_DESIGN.md §2.1 for the full reasoning.
+chmod 2750 $HESTIA/data/api-credentials
 
 # Generating Hestia configuration
 rm -f $HESTIA/conf/hestia.conf > /dev/null 2>&1
@@ -2491,6 +2503,7 @@ systemctl start hestia
 check_result $? "hestia start failed"
 chown hestiaweb:hestiaweb $HESTIA/data/sessions
 chown hestiaweb:hestiaweb $HESTIA/data/adapter-locks
+chown root:hestiaweb $HESTIA/data/api-credentials
 
 # Create backup folder and set correct permission
 mkdir -p /backup/

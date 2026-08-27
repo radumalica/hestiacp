@@ -64,7 +64,8 @@ final class MutationClassificationTest {
 			static function (): string {
 				return "fixed-test-id";
 			},
-			new SpyLockManager(true)
+			new SpyLockManager(true),
+			new \Hestiacp\Adapter\AllowAllAuthorizer()
 		);
 	}
 

@@ -21,5 +21,6 @@ require_once __DIR__ . "/LockManagerInterface.php";
 require_once __DIR__ . "/LockManager.php";
 require_once __DIR__ . "/AuthorizerInterface.php";
 require_once __DIR__ . "/AllowAllAuthorizer.php";
+require_once __DIR__ . "/SameUserAuthorizer.php";
 require_once __DIR__ . "/CommandRegistry.php";
 require_once __DIR__ . "/CommandAdapter.php";

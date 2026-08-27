@@ -54,7 +54,8 @@ final class DomainCreateTest {
 			static function (): string {
 				return "fixed-test-id";
 			},
-			$lockManager ?? self::tempLockManager()
+			$lockManager ?? self::tempLockManager(),
+			new \Hestiacp\Adapter\AllowAllAuthorizer()
 		);
 	}
 

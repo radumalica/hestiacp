@@ -63,7 +63,9 @@ final class AuthorizationTest {
 		// constructor call, which several tests below do on purpose, is
 		// exactly how "the default" is tested: CommandAdapter's OWN
 		// constructor default must kick in, not a default supplied by
-		// this test helper.
+		// this test helper. As of AUTHORIZATION_POLICY_IMPLEMENTATION.md,
+		// that own default is SameUserAuthorizer (a real policy), not
+		// AllowAllAuthorizer — see the "default*" tests below.
 		if ($authorizer !== null) {
 			return new CommandAdapter(
 				$registry ?? self::registryWithMutatingOp(),
@@ -97,8 +99,9 @@ final class AuthorizationTest {
 	}
 
 	public static function register(MiniTest $t): void {
-		$t->test("default AllowAllAuthorizer preserves the existing trusted-caller path for a mutating operation", [self::class, "testDefaultAuthorizerAllowsMutatingOperation"]);
-		$t->test("default AllowAllAuthorizer preserves the existing trusted-caller path for a read operation", [self::class, "testDefaultAuthorizerAllowsReadOperation"]);
+		$t->test("default SameUserAuthorizer allows a mutating operation when actor.user matches target.user", [self::class, "testDefaultAuthorizerAllowsMutatingOperation"]);
+		$t->test("default SameUserAuthorizer allows a read operation when actor.user matches target.user", [self::class, "testDefaultAuthorizerAllowsReadOperation"]);
+		$t->test("default SameUserAuthorizer denies a mutating operation when no actor is supplied at all", [self::class, "testDefaultAuthorizerDeniesWhenActorOmitted"]);
 		$t->test("authorizer is consulted for a read operation, with the normalized actor and validated target", [self::class, "testAuthorizerConsultedForReadOperation"]);
 		$t->test("authorizer is consulted for a mutating operation", [self::class, "testAuthorizerConsultedForMutatingOperation"]);
 		$t->test("invariant 1+2: a denied mutating request never spawns the process AND never acquires the lock", [self::class, "testDeniedMutatingRequestBlocksLockAndProcess"]);
@@ -118,10 +121,11 @@ final class AuthorizationTest {
 	public static function testDefaultAuthorizerAllowsMutatingOperation(): void {
 		$runner = new FakeProcessRunner(new ProcessResult(0, "", ""));
 		// No $authorizer argument passed at all -> CommandAdapter's own
-		// constructor default (AllowAllAuthorizer) must apply.
+		// constructor default (SameUserAuthorizer) must apply. actor.user
+		// matches target.user ("bob"), so the same-user policy allows it.
 		$adapter = self::buildAdapter($runner);
 
-		$result = $adapter->invoke(self::MUTATING_OPERATION, ["user" => "bob"]);
+		$result = $adapter->invoke(self::MUTATING_OPERATION, ["user" => "bob"], ["user" => "bob"]);
 
 		assertEquals("ok", $result->status, "status");
 		assertEquals(1, count($runner->calls), "the operation must proceed to execution under the default authorizer");
@@ -131,9 +135,23 @@ final class AuthorizationTest {
 		$runner = new FakeProcessRunner(new ProcessResult(0, '{"example.com":{}}', ""));
 		$adapter = self::buildAdapter($runner, new CommandRegistry());
 
-		$result = $adapter->invoke("domain.get", ["user" => "admin", "domain" => "example.com"]);
+		$result = $adapter->invoke("domain.get", ["user" => "admin", "domain" => "example.com"], ["user" => "admin"]);
 
 		assertEquals("ok", $result->status, "status");
+	}
+
+	public static function testDefaultAuthorizerDeniesWhenActorOmitted(): void {
+		$runner = new FakeProcessRunner(new ProcessResult(0, "", ""));
+		// No $authorizer argument AND no $actor argument -> actor.user
+		// normalizes to null, which SameUserAuthorizer's default must
+		// deny (it can never equal a real target.user).
+		$adapter = self::buildAdapter($runner);
+
+		$result = $adapter->invoke(self::MUTATING_OPERATION, ["user" => "bob"]);
+
+		assertEquals("adapter_error", $result->status, "status");
+		assertEquals("AUTHORIZATION_DENIED", $result->adapterErrorCode, "adapterErrorCode");
+		assertEquals(0, count($runner->calls), "an omitted actor must never reach execution under the real default policy");
 	}
 
 	public static function testAuthorizerConsultedForReadOperation(): void {
@@ -358,7 +376,13 @@ final class AuthorizationTest {
 		$lockManager = new SpyLockManager(true);
 		// Constructor called with EXACTLY the same 7 arguments the
 		// locking-pass tests already used, before this task existed — no
-		// 8th ($authorizer) argument at all.
+		// 8th ($authorizer) argument at all. The locking mechanics this
+		// test actually cares about (acquire/release around a successful
+		// call) are unchanged; what changed is that a real default
+		// authorization policy is now consulted, so the actor passed to
+		// invoke() must match the target's user for this call to reach
+		// execution at all — see testDefaultAuthorizerDeniesWhenActorOmitted
+		// for the now-denied case this test used to (implicitly) cover.
 		$adapter = new CommandAdapter(
 			self::registryWithMutatingOp(),
 			$runner,
@@ -373,7 +397,7 @@ final class AuthorizationTest {
 			$lockManager
 		);
 
-		$result = $adapter->invoke(self::MUTATING_OPERATION, ["user" => "bob"]);
+		$result = $adapter->invoke(self::MUTATING_OPERATION, ["user" => "bob"], ["user" => "bob"]);
 
 		assertEquals("ok", $result->status, "status");
 		assertEquals("confirmed", $result->mutationState, "mutation_state");

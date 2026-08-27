@@ -4,6 +4,36 @@ Analysis only. No source code was modified to produce this document. No
 tests were run (none were needed — this is a design review of code
 already implemented and already covered by the existing 54-test suite).
 
+> **Operation count is stale.** This checkpoint was written against
+> three operations. Since then, `domain.delete`
+> (`DOMAIN_DELETE_IMPLEMENTATION.md`), the mutation/authorization work
+> (`MUTATION_AND_AUTHORIZATION_DESIGN.md`), `backup.schedule`
+> (`BACKUP_SCHEDULE_IMPLEMENTATION.md`), the generic sensitive-parameter/
+> temp-file mechanism (`SENSITIVE_PARAMETER_DESIGN.md`, hostile-reviewed
+> in `SENSITIVE_PARAMETER_REVIEW.md` and remediated in
+> `SENSITIVE_PARAMETER_REMEDIATION.md`), `database.create`
+> (`DATABASE_CREATE_IMPLEMENTATION.md`), and `database.delete`
+> (`DATABASE_DELETE_IMPLEMENTATION.md`) have all landed — seven
+> operations now exist (`domain.get`, `domain.list`, `domain.create`,
+> `domain.delete`, `backup.schedule`, `database.create`,
+> `database.delete`), all fully tested. `database.create` is the first
+> operation to exercise a real `sensitive => true` parameter end to end.
+> `database.delete` is the first operation requiring **zero** changes to
+> `CommandAdapter.php` or `ParameterValidator.php` — only a registry
+> entry, reusing types `database.create` already introduced — and it
+> surfaced a real, source-verified gap (an unchecked `DROP DATABASE`
+> statement that can let a failed deletion report as `mutation_state =
+> "confirmed"`), documented rather than "fixed" with an invented mutation
+> state, per that task's own explicit instruction not to create one. The
+> exact test count is intentionally omitted here — it is scoped to each
+> operation's own implementation doc and will go stale the next time an
+> operation is added; see `DATABASE_DELETE_IMPLEMENTATION.md` for the
+> current figure.
+> The analysis below is retained for its historical reasoning and is still
+> largely accurate in substance (see the per-section update notes
+> already added throughout this file), but any specific operation count
+> or "N operations" framing predates all three of those documents.
+
 **Context**: three operations exist and are fully tested —
 `domain.get` (read/single), `domain.list` (read/collection),
 `domain.create` (mutating/create) — plus the locking layer

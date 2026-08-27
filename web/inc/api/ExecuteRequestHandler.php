@@ -54,6 +54,20 @@ use Hestiacp\Auth\AccessKeyValidator;
  * denylist.
  */
 final class ExecuteRequestHandler {
+	/**
+	 * Sprint 4 hardening: a purely application-level cap on the raw
+	 * request body, enforced before JSON decoding — independent of, and
+	 * not a replacement for, any webserver/php.ini body-size limit
+	 * (post_max_size etc., which remain a deployment concern outside
+	 * this repository — see
+	 * dev-docs/api-v2/API_V2_HTTP_HARDENING_IMPLEMENTATION.md §Request
+	 * Size). 64 KiB is deliberately generous for this contract's small,
+	 * flat JSON envelopes (the largest today, database.create, has four
+	 * short string fields) while still closing off an unbounded body
+	 * being fully buffered into memory by json_decode().
+	 */
+	private const MAX_BODY_BYTES = 65536;
+
 	private AccessKeyValidator $validator;
 	private CommandAdapter $adapter;
 
@@ -88,6 +102,7 @@ final class ExecuteRequestHandler {
 		try {
 			$this->assertMethod($method);
 			$this->assertContentType($contentType);
+			$this->assertBodySize($rawBody);
 			$body = $this->decodeJson($rawBody);
 
 			// Authentication strictly before operation resolution — an
@@ -137,12 +152,41 @@ final class ExecuteRequestHandler {
 		}
 	}
 
-	/** @return array<string, mixed> */
+	private function assertBodySize(string $rawBody): void {
+		if (strlen($rawBody) > self::MAX_BODY_BYTES) {
+			throw new ApiException("PAYLOAD_TOO_LARGE", 413, "Request body exceeds the maximum allowed size.");
+		}
+	}
+
+	/**
+	 * @return array<string, mixed>
+	 */
 	private function decodeJson(string $rawBody): array {
 		$decoded = json_decode($rawBody, true);
-		if (json_last_error() !== JSON_ERROR_NONE || !is_array($decoded)) {
+
+		// A genuine JSON syntax error (including an empty body — an
+		// empty string is not valid JSON) is MALFORMED_JSON. This is
+		// checked and thrown BEFORE the shape check below, so a syntax
+		// error is never misreported as a shape problem.
+		if (json_last_error() !== JSON_ERROR_NONE) {
 			throw new ApiException("MALFORMED_JSON", 400, "Request body is not valid JSON.");
 		}
+
+		// Syntactically valid JSON that is not an object — a bare
+		// scalar (`42`, `"x"`, `true`), the literal `null`, or a JSON
+		// array (`[1,2,3]`) — is a SHAPE problem, not a syntax one, and
+		// is therefore VALIDATION_FAILED, not MALFORMED_JSON (matching
+		// dev-docs/api-v2/API_V2_HTTP_CONTRACT_DESIGN.md §10's own
+		// stated distinction: "a client debugging a malformed-JSON
+		// failure needs a different fix... than a client debugging a
+		// validation failure"). An empty JSON object (`{}`) is NOT
+		// rejected here — it correctly falls through to
+		// resolveOperation()'s own "operation is required" check next,
+		// exactly like any other object missing that field.
+		if (!is_array($decoded) || self::isList($decoded)) {
+			throw new ApiException("VALIDATION_FAILED", 422, "Request body must be a JSON object.");
+		}
+
 		return $decoded;
 	}
 

@@ -142,6 +142,18 @@ final class ExecuteRequestHandlerTest {
 		$t->test("45. authorization denial for database.create creates no sensitive temp file and leaks no password", [self::class, "testDatabaseCreateAuthorizationDenialCreatesNoTempFileAndNoPasswordLeak"]);
 		$t->test("46. unknown parameter name for an operation is rejected by the API-owned contract", [self::class, "testUnknownParameterNameRejectedByContract"]);
 		$t->test("47. missing required parameter name for an operation is rejected by the API-owned contract", [self::class, "testMissingParameterNameRejectedByContract"]);
+
+		// Sprint 4 — HTTP hardening & error semantics
+		$t->test("48. empty request body is MALFORMED_JSON", [self::class, "testEmptyBodyRejected"]);
+		$t->test("49. bare JSON scalar body is VALIDATION_FAILED, not MALFORMED_JSON", [self::class, "testJsonScalarBodyRejected"]);
+		$t->test("50. literal JSON null body is VALIDATION_FAILED, not MALFORMED_JSON", [self::class, "testJsonNullBodyRejected"]);
+		$t->test("51. top-level JSON array body is VALIDATION_FAILED", [self::class, "testJsonArrayBodyRejected"]);
+		$t->test("52. oversized request body is rejected before JSON parsing (413 PAYLOAD_TOO_LARGE)", [self::class, "testOversizedBodyRejected"]);
+		$t->test("53. missing Content-Type header is rejected the same as a wrong one", [self::class, "testMissingContentTypeRejected"]);
+		$t->test("54. table-driven: every authentication failure reason produces an identical 401 AUTHENTICATION_FAILED envelope, including a revoked credential", [self::class, "testAuthenticationFailureUniformityTable"]);
+		$t->test("55. every response, success or failure, carries Content-Type-appropriate, self-consistent envelope fields (response shape stability)", [self::class, "testResponseEnvelopeShapeStabilityAcrossOutcomes"]);
+		$t->test("56. a read operation's genuine hestia_error (not degraded, not unknown) maps to outcome=failed / 422 / UPSTREAM_COMMAND_FAILED, never silently to 200", [self::class, "testReadOperationGenuineFailureOutcome"]);
+		$t->test("57. an unexpected exception thrown mid-pipeline never leaks the operation's own parameters (e.g. a password) in the sanitized response", [self::class, "testUnexpectedExceptionDuringMutatingOperationDoesNotLeakParams"]);
 	}
 
 	public static function testValidCredentialsAuthenticate(): void {
@@ -1203,5 +1215,235 @@ final class ExecuteRequestHandlerTest {
 		assertEquals(422, $status);
 		assertEquals("VALIDATION_FAILED", $envelope["error"]["code"]);
 		assertEquals(0, count($runner->calls));
+	}
+
+	// ── Sprint 4 tests ─────────────────────────────────────────────
+
+	public static function testEmptyBodyRejected(): void {
+		[, $validator] = self::freshValidator(["alice" => "alice-secret"]);
+		$runner = new FakeProcessRunner(new ProcessResult(0, "{}", ""));
+		$handler = new ExecuteRequestHandler($validator, self::buildAdapter($runner));
+
+		[$status, $envelope] = $handler->handle("POST", "application/json", self::basicHeader("alice", "alice-secret"), "");
+
+		assertEquals(400, $status);
+		assertEquals("MALFORMED_JSON", $envelope["error"]["code"], "an empty body is a JSON syntax error, not a shape problem");
+		assertEquals(0, count($runner->calls));
+	}
+
+	public static function testJsonScalarBodyRejected(): void {
+		[, $validator] = self::freshValidator(["alice" => "alice-secret"]);
+		$runner = new FakeProcessRunner(new ProcessResult(0, "{}", ""));
+		$handler = new ExecuteRequestHandler($validator, self::buildAdapter($runner));
+
+		foreach (["42", '"a string"', "true"] as $scalarBody) {
+			[$status, $envelope] = $handler->handle("POST", "application/json", self::basicHeader("alice", "alice-secret"), $scalarBody);
+			assertEquals(422, $status, "body: $scalarBody");
+			assertEquals("VALIDATION_FAILED", $envelope["error"]["code"], "body: $scalarBody — a bare JSON scalar is syntactically valid JSON, so it must NOT be MALFORMED_JSON");
+		}
+		assertEquals(0, count($runner->calls));
+	}
+
+	public static function testJsonNullBodyRejected(): void {
+		[, $validator] = self::freshValidator(["alice" => "alice-secret"]);
+		$runner = new FakeProcessRunner(new ProcessResult(0, "{}", ""));
+		$handler = new ExecuteRequestHandler($validator, self::buildAdapter($runner));
+
+		[$status, $envelope] = $handler->handle("POST", "application/json", self::basicHeader("alice", "alice-secret"), "null");
+
+		assertEquals(422, $status);
+		assertEquals("VALIDATION_FAILED", $envelope["error"]["code"], "the literal JSON null is syntactically valid JSON, so it must NOT be MALFORMED_JSON");
+		assertEquals(0, count($runner->calls));
+	}
+
+	public static function testJsonArrayBodyRejected(): void {
+		[, $validator] = self::freshValidator(["alice" => "alice-secret"]);
+		$runner = new FakeProcessRunner(new ProcessResult(0, "{}", ""));
+		$handler = new ExecuteRequestHandler($validator, self::buildAdapter($runner));
+
+		[$status, $envelope] = $handler->handle("POST", "application/json", self::basicHeader("alice", "alice-secret"), '["domain.get", {"user":"alice"}]');
+
+		assertEquals(422, $status);
+		assertEquals("VALIDATION_FAILED", $envelope["error"]["code"]);
+		assertEquals(0, count($runner->calls));
+	}
+
+	public static function testOversizedBodyRejected(): void {
+		[, $validator] = self::freshValidator(["alice" => "alice-secret"]);
+		$runner = new FakeProcessRunner(new ProcessResult(0, "{}", ""));
+		$handler = new ExecuteRequestHandler($validator, self::buildAdapter($runner));
+
+		// Oversized but otherwise well-formed JSON — proves rejection
+		// happens on raw byte length, strictly before JSON parsing is
+		// even attempted (a body this large would also fail
+		// downstream validation, but the point of this test is that it
+		// never reaches that far).
+		$oversizedDomain = str_repeat("a", 100000);
+		$body = json_encode(["operation" => "domain.get", "params" => ["user" => "alice", "domain" => $oversizedDomain]]);
+
+		[$status, $envelope] = $handler->handle("POST", "application/json", self::basicHeader("alice", "alice-secret"), $body);
+
+		assertEquals(413, $status);
+		assertEquals("PAYLOAD_TOO_LARGE", $envelope["error"]["code"]);
+		assertEquals(0, count($runner->calls));
+	}
+
+	public static function testMissingContentTypeRejected(): void {
+		[, $validator] = self::freshValidator(["alice" => "alice-secret"]);
+		$runner = new FakeProcessRunner(new ProcessResult(0, "{}", ""));
+		$handler = new ExecuteRequestHandler($validator, self::buildAdapter($runner));
+
+		[$status, $envelope] = $handler->handle(
+			"POST",
+			"",
+			self::basicHeader("alice", "alice-secret"),
+			json_encode(["operation" => "domain.get", "params" => ["user" => "alice", "domain" => "example.com"]])
+		);
+
+		assertEquals(415, $status);
+		assertEquals("UNSUPPORTED_MEDIA_TYPE", $envelope["error"]["code"]);
+		assertEquals(0, count($runner->calls));
+	}
+
+	public static function testAuthenticationFailureUniformityTable(): void {
+		[$dir, $validator] = self::freshValidator(["alice" => "alice-secret"]);
+		// A second, real credential that will be revoked below, to
+		// prove revocation produces the identical envelope too.
+		$revokedId = "key-revoked-user";
+		file_put_contents($dir . $revokedId, json_encode(["user" => "revoked-user", "secret_hash" => password_hash("revoked-secret", PASSWORD_DEFAULT)]));
+		$revokedHeader = "Basic " . base64_encode($revokedId . ":revoked-secret");
+		unlink($dir . $revokedId); // revoke: the credential worked a moment ago, now it does not
+
+		$runner = new FakeProcessRunner(new ProcessResult(0, "{}", ""));
+		$handler = new ExecuteRequestHandler($validator, self::buildAdapter($runner));
+		$body = json_encode(["operation" => "domain.get", "params" => ["user" => "alice", "domain" => "example.com"]]);
+
+		$cases = [
+			"missing header" => null,
+			"malformed header (not Basic)" => "NotBasic abc123",
+			"malformed header (bad base64)" => "Basic not-valid-base64!!!",
+			"malformed header (no colon)" => "Basic " . base64_encode("no-colon-at-all"),
+			"unknown credential id" => "Basic " . base64_encode("key-does-not-exist:whatever"),
+			"wrong secret" => self::basicHeader("alice", "totally-wrong-secret"),
+			"revoked credential" => $revokedHeader,
+		];
+
+		$results = [];
+		foreach ($cases as $label => $header) {
+			[$status, $envelope] = $handler->handle("POST", "application/json", $header, $body);
+			assertEquals(401, $status, "status for: $label");
+			assertEquals("AUTHENTICATION_FAILED", $envelope["error"]["code"], "error code for: $label");
+			$results[$label] = $envelope;
+		}
+
+		$reference = $results["missing header"];
+		foreach ($results as $label => $envelope) {
+			assertEquals($reference, $envelope, "every authentication failure envelope must be byte-identical — case '$label' differed, which would disclose which failure reason occurred");
+		}
+		assertEquals(0, count($runner->calls), "no authentication failure of any kind may ever reach CommandAdapter");
+	}
+
+	public static function testResponseEnvelopeShapeStabilityAcrossOutcomes(): void {
+		// Every envelope this endpoint ever returns — success or
+		// failure — must carry exactly this fixed key set, nothing
+		// more, nothing less (dev-docs/api-v2/API_V2_HTTP_CONTRACT_DESIGN.md §13).
+		$expectedKeys = ["api_version", "success", "outcome", "data", "error", "meta"];
+
+		[, $validator] = self::freshValidator(["alice" => "alice-secret"]);
+
+		$scenarios = [
+			"success" => static function () use ($validator) {
+				$runner = new FakeProcessRunner(new ProcessResult(0, '{"example.com":{}}', ""));
+				$handler = new ExecuteRequestHandler($validator, self::buildAdapter($runner));
+				return $handler->handle("POST", "application/json", self::basicHeader("alice", "alice-secret"), json_encode(["operation" => "domain.get", "params" => ["user" => "alice", "domain" => "example.com"]]));
+			},
+			"warning" => static function () use ($validator) {
+				$runner = new FakeProcessRunner(new ProcessResult(20, "", "Restart failed"));
+				$handler = new ExecuteRequestHandler($validator, self::buildAdapter($runner));
+				return $handler->handle("POST", "application/json", self::basicHeader("alice", "alice-secret"), json_encode(["operation" => "domain.create", "params" => ["user" => "alice", "domain" => "example.com"]]));
+			},
+			"unknown" => static function () use ($validator) {
+				$runner = new FakeProcessRunner(new ProcessResult(4, "", "Backup already scheduled"));
+				$handler = new ExecuteRequestHandler($validator, self::buildAdapter($runner));
+				return $handler->handle("POST", "application/json", self::basicHeader("alice", "alice-secret"), json_encode(["operation" => "backup.schedule", "params" => ["user" => "alice"]]));
+			},
+			"validation error" => static function () use ($validator) {
+				$runner = new FakeProcessRunner(new ProcessResult(0, "{}", ""));
+				$handler = new ExecuteRequestHandler($validator, self::buildAdapter($runner));
+				return $handler->handle("POST", "application/json", self::basicHeader("alice", "alice-secret"), json_encode(["operation" => "domain.get", "params" => ["user" => "alice"]]));
+			},
+			"authentication error" => static function () use ($validator) {
+				$runner = new FakeProcessRunner(new ProcessResult(0, "{}", ""));
+				$handler = new ExecuteRequestHandler($validator, self::buildAdapter($runner));
+				return $handler->handle("POST", "application/json", null, json_encode(["operation" => "domain.get", "params" => ["user" => "alice", "domain" => "example.com"]]));
+			},
+			"authorization error" => static function () use ($validator) {
+				$runner = new FakeProcessRunner(new ProcessResult(0, "{}", ""));
+				$handler = new ExecuteRequestHandler($validator, self::buildAdapter($runner));
+				return $handler->handle("POST", "application/json", self::basicHeader("alice", "alice-secret"), json_encode(["operation" => "domain.get", "params" => ["user" => "bob", "domain" => "example.com"]]));
+			},
+			"internal error" => static function () use ($validator) {
+				$runner = new ThrowingProcessRunner(new \RuntimeException("boom"));
+				$handler = new ExecuteRequestHandler($validator, self::buildAdapter($runner));
+				return $handler->handle("POST", "application/json", self::basicHeader("alice", "alice-secret"), json_encode(["operation" => "domain.get", "params" => ["user" => "alice", "domain" => "example.com"]]));
+			},
+		];
+
+		foreach ($scenarios as $label => $run) {
+			[, $envelope] = $run();
+			$actualKeys = array_keys($envelope);
+			sort($actualKeys);
+			$expected = $expectedKeys;
+			sort($expected);
+			assertEquals($expected, $actualKeys, "envelope key set for scenario '$label'");
+		}
+	}
+
+	public static function testReadOperationGenuineFailureOutcome(): void {
+		[, $validator] = self::freshValidator(["alice" => "alice-secret"]);
+		// Exit code 3 = E_NOTEXIST. domain.get is read-only
+		// (mutationState is always null for it), so ResponseMapper's
+		// dedicated read-failure branch applies: this must be a plain,
+		// honest "failed" — never silently reported as a 200 success,
+		// and never "unknown" (a read has no partial-mutation ambiguity
+		// to preserve).
+		$runner = new FakeProcessRunner(new ProcessResult(3, "", "Domain does not exist"));
+		$handler = new ExecuteRequestHandler($validator, self::buildAdapter($runner));
+
+		[$status, $envelope] = $handler->handle(
+			"POST",
+			"application/json",
+			self::basicHeader("alice", "alice-secret"),
+			json_encode(["operation" => "domain.get", "params" => ["user" => "alice", "domain" => "nonexistent.example"]])
+		);
+
+		assertEquals(422, $status);
+		assertTrue($envelope["success"] === false);
+		assertEquals("failed", $envelope["outcome"]);
+		assertEquals("UPSTREAM_COMMAND_FAILED", $envelope["error"]["code"]);
+		assertEquals(["hestia_error_code" => "E_NOTEXIST"], $envelope["error"]["details"]);
+	}
+
+	public static function testUnexpectedExceptionDuringMutatingOperationDoesNotLeakParams(): void {
+		[, $validator] = self::freshValidator(["alice" => "alice-secret"]);
+		$plainPassword = "Crash_Secret_" . bin2hex(random_bytes(4));
+		$runner = new ThrowingProcessRunner(new \RuntimeException("process spawn failed for user alice with password $plainPassword"));
+		$handler = new ExecuteRequestHandler($validator, self::buildAdapter($runner));
+
+		[$status, $envelope] = $handler->handle(
+			"POST",
+			"application/json",
+			self::basicHeader("alice", "alice-secret"),
+			json_encode([
+				"operation" => "database.create",
+				"params" => ["user" => "alice", "database" => "db1", "dbuser" => "u1", "password" => $plainPassword],
+			])
+		);
+
+		assertEquals(500, $status);
+		assertEquals("INTERNAL_ERROR", $envelope["error"]["code"]);
+		$encoded = json_encode($envelope);
+		assertFalse(strpos($encoded, $plainPassword) !== false, "the password must never leak through an unsanitized exception message");
+		assertFalse(strpos($encoded, "RuntimeException") !== false);
 	}
 }

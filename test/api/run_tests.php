@@ -27,6 +27,7 @@ require_once __DIR__ . "/OperationParameterContractTest.php";
 require_once __DIR__ . "/ParameterNormalizerTest.php";
 require_once __DIR__ . "/ResponseMapperTest.php";
 require_once __DIR__ . "/ExecuteRequestHandlerTest.php";
+require_once __DIR__ . "/RateLimiterTest.php";
 require_once __DIR__ . "/GenericityTest.php";
 
 use Hestiacp\Adapter\Test\MiniTest;
@@ -34,6 +35,7 @@ use Hestiacp\Api\Test\ExecuteRequestHandlerTest;
 use Hestiacp\Api\Test\GenericityTest;
 use Hestiacp\Api\Test\OperationParameterContractTest;
 use Hestiacp\Api\Test\ParameterNormalizerTest;
+use Hestiacp\Api\Test\RateLimiterTest;
 use Hestiacp\Api\Test\ResponseMapperTest;
 
 $t = new MiniTest();
@@ -41,5 +43,6 @@ OperationParameterContractTest::register($t);
 ParameterNormalizerTest::register($t);
 ResponseMapperTest::register($t);
 ExecuteRequestHandlerTest::register($t);
+RateLimiterTest::register($t);
 GenericityTest::register($t);
 exit($t->run());

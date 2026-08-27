@@ -31,6 +31,12 @@ final class GenericityTest {
 		"ParameterNormalizer.php",
 		"ResponseMapper.php",
 		"ExecuteRequestHandler.php",
+		"RateLimitStoreInterface.php",
+		"RateLimitStoreUnavailableException.php",
+		"RateLimitDecision.php",
+		"InMemoryRateLimitStore.php",
+		"FilesystemRateLimitStore.php",
+		"RateLimiter.php",
 	];
 
 	public static function register(MiniTest $t): void {

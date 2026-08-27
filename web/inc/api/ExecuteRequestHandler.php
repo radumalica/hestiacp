@@ -14,6 +14,15 @@ use Hestiacp\Auth\AccessKeyValidator;
  *     -> normalize target -> CommandAdapter::invoke()
  *       -> resolve -> validate -> normalize -> authorize -> lock -> execute
  *
+ * Sprint 5 (see dev-docs/api-v2/API_V2_RATE_LIMITING_IMPLEMENTATION.md)
+ * inserts exactly two additional, HTTP-layer-only checks that never
+ * touch CommandAdapter/LockManager/AuthorizerInterface: a pre-auth
+ * per-IP check as the very first thing handle() does (before even
+ * method/content-type/body-size checks, and before authenticate()'s own
+ * expensive work), and an authenticated per-credential check
+ * immediately after authenticate() succeeds, before operation
+ * resolution.
+ *
  * Deliberately HTTP-transport-independent: handle() takes plain scalar
  * inputs (method, content type, Authorization header value, raw body
  * string) rather than reading $_SERVER/php://input directly, so this
@@ -70,6 +79,7 @@ final class ExecuteRequestHandler {
 
 	private AccessKeyValidator $validator;
 	private CommandAdapter $adapter;
+	private RateLimiter $rateLimiter;
 
 	/** @var string[] */
 	private array $allowedOperations;
@@ -86,20 +96,61 @@ final class ExecuteRequestHandler {
 	 *        mutating operation without this sprint exposing one in
 	 *        production (web/api/v2/index.php never passes this
 	 *        argument).
+	 * @param RateLimiter|null $rateLimiter Sprint 5. Defaults to a real,
+	 *        working RateLimiter backed by InMemoryRateLimitStore — safe
+	 *        for the ~100+ pre-existing tests that never mention rate
+	 *        limiting at all (each constructs its own
+	 *        ExecuteRequestHandler instance, so each gets its own
+	 *        isolated in-process counters; no cross-test interference is
+	 *        possible). Production (web/api/v2/index.php) ALWAYS passes
+	 *        an explicit RateLimiter backed by FilesystemRateLimitStore
+	 *        instead — an in-memory store never persists across the
+	 *        separate PHP processes a real PHP-FPM/CGI deployment uses
+	 *        per request, so relying on this default in production would
+	 *        silently rate-limit nothing. See
+	 *        dev-docs/api-v2/API_V2_RATE_LIMITING_IMPLEMENTATION.md §9.
 	 */
-	public function __construct(AccessKeyValidator $validator, CommandAdapter $adapter, ?array $allowedOperations = null) {
+	public function __construct(
+		AccessKeyValidator $validator,
+		CommandAdapter $adapter,
+		?array $allowedOperations = null,
+		?RateLimiter $rateLimiter = null
+	) {
 		$this->validator = $validator;
 		$this->adapter = $adapter;
 		$this->allowedOperations = $allowedOperations ?? OperationAllowlist::ALLOWED_OPERATIONS;
+		$this->rateLimiter = $rateLimiter ?? new RateLimiter(new InMemoryRateLimitStore());
 	}
 
 	/**
+	 * @param string $clientIp Sprint 5: the client's network address as
+	 *        seen at the HTTP boundary (REMOTE_ADDR) — used ONLY as the
+	 *        pre-authentication rate-limit bucket key, never trusted for
+	 *        anything security-relevant beyond that. Deliberately a
+	 *        plain scalar the caller supplies (matching every other
+	 *        handle() parameter), not read from $_SERVER here — this
+	 *        class remains fully HTTP-transport-independent. Defaults to
+	 *        "" so every pre-Sprint-5 test call site keeps working
+	 *        unchanged; production (web/api/v2/index.php) always passes
+	 *        the real $_SERVER["REMOTE_ADDR"].
 	 * @return array{0: int, 1: array<string, mixed>} [$httpStatus, $envelope]
 	 */
-	public function handle(string $method, string $contentType, ?string $authorizationHeader, string $rawBody): array {
+	public function handle(string $method, string $contentType, ?string $authorizationHeader, string $rawBody, string $clientIp = ""): array {
 		$operation = null;
 
 		try {
+			// Pre-authentication rate limiting runs before ANY other
+			// work — including method/content-type/body-size checks —
+			// so a flood of requests against this endpoint is bounded
+			// regardless of how malformed they are, and strictly before
+			// authenticate()'s own expensive password_verify() work
+			// (§4/§5 of the rate-limiting doc). The key is REMOTE_ADDR
+			// only: it does NOT depend on whether credentials later turn
+			// out to be valid, so an unknown credential id and a valid
+			// one sharing the same IP always share the same bucket —
+			// this layer can never reveal credential existence.
+			$this->enforcePreAuthRateLimit($clientIp);
+
 			$this->assertMethod($method);
 			$this->assertContentType($contentType);
 			$this->assertBodySize($rawBody);
@@ -109,7 +160,14 @@ final class ExecuteRequestHandler {
 			// unauthenticated request never reaches CommandAdapter, and
 			// never even learns whether its requested operation exists
 			// (§12's own enforced invariant).
-			$actor = $this->authenticate($authorizationHeader);
+			[$credentialId, $actor] = $this->authenticate($authorizationHeader);
+
+			// Authenticated rate limiting: only reached once
+			// authenticate() has already succeeded, keyed by the
+			// AUTHENTICATED credential id (never the raw secret) — a
+			// separate bucket per credential, so one authenticated
+			// caller can never exhaust another's allowance.
+			$this->enforceAuthenticatedRateLimit($credentialId);
 
 			$operation = $this->resolveOperation($body);
 			$params = $this->validateEnvelope($body);
@@ -190,7 +248,9 @@ final class ExecuteRequestHandler {
 		return $decoded;
 	}
 
-	/** @return array{user: string} */
+	/**
+	 * @return array{0: string, 1: array{user: string}} [$credentialId, $actor]
+	 */
 	private function authenticate(?string $authorizationHeader): array {
 		$credentials = $this->extractBasicCredentials($authorizationHeader);
 		if ($credentials === null) {
@@ -203,7 +263,64 @@ final class ExecuteRequestHandler {
 			throw $this->authenticationFailed();
 		}
 
-		return ["user" => $user];
+		// $id is returned solely as the Sprint 5 authenticated
+		// rate-limit bucket key — it is never merged into $actor, which
+		// remains exactly {user: ...}, unchanged from Sprints 1-4.
+		return [$id, ["user" => $user]];
+	}
+
+	/**
+	 * Pre-authentication bucket: keyed by client IP only. Fails CLOSED —
+	 * see dev-docs/api-v2/API_V2_RATE_LIMITING_IMPLEMENTATION.md §11 for
+	 * the full rationale (a remote, unauthenticated caller has no way to
+	 * make the counter store itself unavailable, since bucket keys are
+	 * always hashed into a fixed-length filename before touching the
+	 * filesystem — a genuine storage failure here is an environmental
+	 * fault, not something a request can trigger, so denying is safe).
+	 */
+	private function enforcePreAuthRateLimit(string $clientIp): void {
+		try {
+			$decision = $this->rateLimiter->checkPreAuth($clientIp);
+		} catch (RateLimitStoreUnavailableException $exception) {
+			throw $this->rateLimited(null);
+		}
+
+		if (!$decision->allowed) {
+			throw $this->rateLimited($decision->retryAfterSeconds);
+		}
+	}
+
+	/**
+	 * Authenticated bucket: keyed by the authenticated credential id.
+	 * Fails OPEN — an already-authenticated caller who has already paid
+	 * the cost of a valid credential is not denied service merely
+	 * because a counter file could not be read/written; see the doc's
+	 * §11 for the full rationale (the pre-authentication layer above
+	 * already provides the fail-closed line of defense against
+	 * unauthenticated volumetric abuse).
+	 */
+	private function enforceAuthenticatedRateLimit(string $credentialId): void {
+		try {
+			$decision = $this->rateLimiter->checkAuthenticated($credentialId);
+		} catch (RateLimitStoreUnavailableException $exception) {
+			return;
+		}
+
+		if (!$decision->allowed) {
+			throw $this->rateLimited($decision->retryAfterSeconds);
+		}
+	}
+
+	private function rateLimited(?int $retryAfterSeconds): ApiException {
+		// $retryAfterSeconds is deterministic (derived only from the
+		// fixed window boundary, never from any counter value) and safe
+		// to disclose — it reveals nothing about credential existence or
+		// internal counters, only "try again in N seconds." Omitted
+		// entirely (null details) for the fail-closed storage-failure
+		// case, where no window boundary was ever computed.
+		$details = $retryAfterSeconds !== null ? ["retry_after_seconds" => $retryAfterSeconds] : null;
+
+		return new ApiException("RATE_LIMITED", 429, "Too many requests. Please try again later.", $details);
 	}
 
 	private function authenticationFailed(): ApiException {

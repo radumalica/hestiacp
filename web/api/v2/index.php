@@ -56,6 +56,8 @@ use Hestiacp\Adapter\CommandAdapter;
 use Hestiacp\Adapter\CommandRegistry;
 use Hestiacp\Adapter\ProcOpenProcessRunner;
 use Hestiacp\Api\ExecuteRequestHandler;
+use Hestiacp\Api\FilesystemRateLimitStore;
+use Hestiacp\Api\RateLimiter;
 use Hestiacp\Auth\AccessKeyValidator;
 
 try {
@@ -65,6 +67,14 @@ try {
 	// for a server that otherwise strips the Authorization header before
 	// PHP ever sees it under $_SERVER["HTTP_AUTHORIZATION"].
 	$authorizationHeader = $_SERVER["HTTP_AUTHORIZATION"] ?? $_SERVER["REDIRECT_HTTP_AUTHORIZATION"] ?? null;
+	// Sprint 5: the client's raw network address, used ONLY as the
+	// pre-authentication rate-limit bucket key
+	// (dev-docs/api-v2/API_V2_RATE_LIMITING_IMPLEMENTATION.md §4/§6).
+	// Deliberately REMOTE_ADDR alone — no X-Forwarded-For or similar
+	// header is read anywhere in this file, since no trusted-proxy
+	// mechanism exists in this repository to validate such a header
+	// against (see that doc's §2/§6 for the full reasoning).
+	$clientIp = $_SERVER["REMOTE_ADDR"] ?? "";
 	$rawBody = file_get_contents("php://input");
 	if ($rawBody === false) {
 		$rawBody = "";
@@ -74,12 +84,23 @@ try {
 	// sibling collaborators (LockManager, SameUserAuthorizer) — nothing
 	// about authorization or locking is decided in this file; see
 	// CommandAdapter::__construct()'s own default parameters.
+	//
+	// The RateLimiter is explicitly constructed here, backed by
+	// FilesystemRateLimitStore at its own default (system-temp-backed)
+	// directory, rather than relying on ExecuteRequestHandler's own
+	// convenience default (InMemoryRateLimitStore) — an in-memory store
+	// never persists across the separate PHP processes a real
+	// PHP-FPM/CGI deployment uses per request, so only an explicit,
+	// filesystem-backed store actually rate-limits anything here. See
+	// dev-docs/api-v2/API_V2_RATE_LIMITING_IMPLEMENTATION.md §9.
 	$handler = new ExecuteRequestHandler(
 		new AccessKeyValidator(),
-		new CommandAdapter(new CommandRegistry(), new ProcOpenProcessRunner())
+		new CommandAdapter(new CommandRegistry(), new ProcOpenProcessRunner()),
+		null,
+		new RateLimiter(new FilesystemRateLimitStore())
 	);
 
-	[$httpStatus, $envelope] = $handler->handle($method, $contentType, $authorizationHeader, $rawBody);
+	[$httpStatus, $envelope] = $handler->handle($method, $contentType, $authorizationHeader, $rawBody, $clientIp);
 	$body = json_encode($envelope);
 
 	// json_encode() itself can fail (e.g. non-UTF-8 bytes reaching

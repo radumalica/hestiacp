@@ -9,3 +9,23 @@
         systemctl restart hestia.service >/dev/null 2>&1 || true
     endscript
 }
+
+# API v2 audit trail (web/inc/api/FileAuditLogger.php). A separate stanza,
+# not merged into /var/log/hestia/*.log above: different location
+# ($HESTIA/data/api-v2-audit, not $HESTIA/log — see
+# dev-docs/api-v2/API_V2_AUDIT_LOGGING_PRODUCTION_IMPLEMENTATION.md §3 for
+# why), different owner (hestiaweb, not root), and no postrotate action
+# needed — FileAuditLogger opens/closes audit.log once per write (never
+# holds a long-lived handle across requests), so a rename-then-recreate
+# rotation is safe with nothing to reload/signal, unlike the
+# always-open handles system.log/nginx-error.log/etc. above have.
+# rotate 12 / monthly mirrors this same file's own existing convention
+# for /var/log/hestia/*.log above — an operational default, not a
+# legal/compliance retention requirement.
+/usr/local/hestia/data/api-v2-audit/*.log {
+    rotate 12
+    monthly
+    missingok
+    notifempty
+    create 0600 hestiaweb hestiaweb
+}

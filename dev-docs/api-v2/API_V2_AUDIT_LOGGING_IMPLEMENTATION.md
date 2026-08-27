@@ -283,6 +283,15 @@ from the `0660` shape `install/hst-install-ubuntu.sh` uses for
 `/var/log/hestia/*.log`, since — unlike those files — no second process
 identity ever needs read access to this one).
 
+> **Superseded by Sprint 7** (see
+> `dev-docs/api-v2/API_V2_AUDIT_LOGGING_PRODUCTION_IMPLEMENTATION.md`
+> §5): on actual implementation, the directory was provisioned `0700`,
+> not `0770` — Sprint 7 determined the `adapter-locks` group-access
+> shape isn't justified here (no legitimate second reader exists in the
+> `hestiaweb` group for security-sensitive audit records), so every
+> `0770` reference on this page is historical intent, not the shipped
+> permission.
+
 ## 12. Concurrency behavior
 
 Each write is one `fopen("ab")` → `flock(LOCK_EX)` → `fwrite()` →
@@ -406,21 +415,21 @@ every new audit file — zero matches.
 
 ## 17. Known limitations
 
-- **Inert in production until provisioned.** `FileAuditLogger`'s
-  default directory (`/usr/local/hestia/data/api-v2-audit/`) is not
-  created by anything in this sprint. Until an installer change (out of
-  this sprint's scope — see §10/§19 STOP-condition reasoning) provisions
-  it `hestiaweb:hestiaweb 0770`, every write fails and fail-open means
-  no event is ever actually recorded on a real deployment. This is the
-  single most important caveat of this sprint — see §21.
-- **No log rotation.** `install/deb/logrotate/hestia` only covers
-  `/var/log/hestia/*.log`, which this audit log deliberately does not
-  live under (§10) — confirmed by reading that file directly, not
-  assumed. `audit.log` grows unbounded until an operator or a future
-  sprint adds rotation (either a new logrotate stanza, requiring the
-  same installer change as provisioning itself, or an in-process
-  size-based rotation mirroring `log_history()`'s own 300-line
-  truncate-on-write pattern).
+- **Inert in production until provisioned** — **resolved by Sprint 7**
+  (`dev-docs/api-v2/API_V2_AUDIT_LOGGING_PRODUCTION_IMPLEMENTATION.md`):
+  `FileAuditLogger`'s default directory
+  (`/usr/local/hestia/data/api-v2-audit/`) is not created by anything in
+  *this* sprint (Sprint 6); until an installer change provisions it,
+  every write fails and fail-open means no event is ever actually
+  recorded on a real deployment. Sprint 7 adds exactly that installer
+  change (fresh-install and upgrade), provisioned `0700` rather than the
+  `0770` this doc originally described — see §11's superseded note
+  above.
+- **No log rotation** — **resolved by Sprint 7**, which adds a
+  dedicated `logrotate` stanza. `install/deb/logrotate/hestia` only
+  covers `/var/log/hestia/*.log`, which this audit log deliberately does
+  not live under (§10) — confirmed by reading that file directly, not
+  assumed. Prior to Sprint 7, `audit.log` would have grown unbounded.
   `AuditLoggerTest::testConcurrentWritesDoNotCorruptRecords` confirms
   writes themselves are safe; it says nothing about unbounded growth.
 - **No failure detectability mechanism** — see §13 for why none was
@@ -491,3 +500,10 @@ logging will record **nothing** in a real deployment until
 explicitly separate installer change — this is a known, load-bearing
 limitation stated here deliberately rather than left implicit, and
 should be the very next follow-up item.
+
+> **Update — Sprint 7**: that follow-up item is done. See
+> `dev-docs/api-v2/API_V2_AUDIT_LOGGING_PRODUCTION_IMPLEMENTATION.md`
+> for fresh-install/upgrade provisioning (directory mode `0700`, not the
+> `0770` this page describes — see §11's note) and log rotation. Audit
+> logging is no longer inert once that sprint's installer/upgrade
+> changes are applied.

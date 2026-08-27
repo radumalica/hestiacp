@@ -34,6 +34,23 @@ mkdir -p "$HESTIA/data/api-credentials"
 chown root:hestiaweb "$HESTIA/data/api-credentials"
 chmod 2750 "$HESTIA/data/api-credentials"
 
+# Create $HESTIA/data/api-v2-audit for API v2 audit logging
+# (web/inc/api/FileAuditLogger.php) on installations that predate it.
+# mkdir -p/chown/chmod are all idempotent and safe to re-run on every
+# upgrade: an already-existing directory (and any audit.log already
+# inside it) is left untouched by mkdir -p, and re-applying the same
+# ownership/permissions on every upgrade both provisions it for the
+# first time and repairs it if it was ever manually altered — exactly
+# the same pattern already used for api-credentials above. hestiaweb
+# (not root:hestiaweb/setgid, unlike api-credentials) since only the PHP
+# web process itself ever reads or writes audit.log — see
+# dev-docs/api-v2/API_V2_AUDIT_LOGGING_PRODUCTION_IMPLEMENTATION.md §4/§5
+# for why this deliberately does not copy the api-credentials pattern.
+echo "[ * ] Creating API v2 audit log directory"
+mkdir -p "$HESTIA/data/api-v2-audit"
+chown hestiaweb:hestiaweb "$HESTIA/data/api-v2-audit"
+chmod 700 "$HESTIA/data/api-v2-audit"
+
 # fix/file manager ignores user language
 echo "[ * ] Fix File Manager ignoring user language"
 cp -f "$HESTIA"/install/deb/filemanager/filegator/configuration.php "$HESTIA"/web/fm/configuration.php

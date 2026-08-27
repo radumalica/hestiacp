@@ -1309,7 +1309,8 @@ ln -s /var/log/hestia $HESTIA/log
 # Building directory tree and creating some blank files for Hestia
 mkdir -p $HESTIA/conf $HESTIA/ssl $HESTIA/data/ips \
 	$HESTIA/data/queue $HESTIA/data/users $HESTIA/data/firewall \
-	$HESTIA/data/sessions $HESTIA/data/adapter-locks $HESTIA/data/api-credentials
+	$HESTIA/data/sessions $HESTIA/data/adapter-locks $HESTIA/data/api-credentials \
+	$HESTIA/data/api-v2-audit
 touch $HESTIA/data/queue/backup.pipe $HESTIA/data/queue/disk.pipe \
 	$HESTIA/data/queue/webstats.pipe $HESTIA/data/queue/restart.pipe \
 	$HESTIA/data/queue/traffic.pipe $HESTIA/data/queue/daily.pipe $HESTIA/log/system.log \
@@ -1336,6 +1337,19 @@ chmod 770 $HESTIA/data/adapter-locks
 # regardless of which identity created it — see
 # CREDENTIAL_PROVISIONING_WIRING_DESIGN.md §2.1 for the full reasoning.
 chmod 2750 $HESTIA/data/api-credentials
+# $HESTIA/data/api-v2-audit holds the API v2 audit trail
+# (web/inc/api/FileAuditLogger.php) — a single append-only audit.log
+# file, opened/closed per write, never held open across requests.
+# Ownership is set to hestiaweb:hestiaweb below, once the hestiaweb user
+# exists, matching adapter-locks (only the PHP web process itself ever
+# reads or writes here). Unlike adapter-locks (0770) this directory is
+# 0700 (owner-only, no group access) — audit records carry
+# security-sensitive metadata (user/domain/database identifiers, source
+# IPs, error codes), and unlike lock files there is no legitimate
+# secondary reader in the "hestiaweb" group, so the minimum required
+# access is owner-only. See
+# dev-docs/api-v2/API_V2_AUDIT_LOGGING_PRODUCTION_IMPLEMENTATION.md §4/§5.
+chmod 700 $HESTIA/data/api-v2-audit
 
 # Generating Hestia configuration
 rm -f $HESTIA/conf/hestia.conf > /dev/null 2>&1
@@ -2496,6 +2510,7 @@ check_result $? "hestia start failed"
 chown hestiaweb:hestiaweb $HESTIA/data/sessions
 chown hestiaweb:hestiaweb $HESTIA/data/adapter-locks
 chown root:hestiaweb $HESTIA/data/api-credentials
+chown hestiaweb:hestiaweb $HESTIA/data/api-v2-audit
 
 # Create backup folder and set correct permission
 mkdir -p /backup/

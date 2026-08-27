@@ -23,6 +23,18 @@ use Hestiacp\Auth\AccessKeyValidator;
  * immediately after authenticate() succeeds, before operation
  * resolution.
  *
+ * Sprint 6 (see dev-docs/api-v2/API_V2_AUDIT_LOGGING_IMPLEMENTATION.md)
+ * adds exactly ONE additional observation point: after the try/catch
+ * below has already produced the final [$httpStatus, $envelope] result
+ * — success or failure, from any exit path — handle() builds one
+ * AuditEvent from that already-computed result plus the HTTP-layer
+ * context gathered along the way (request id, attempted/authenticated
+ * credential id, client IP, redacted target) and hands it to the
+ * injected AuditLogger. This is purely an observer: it never influences
+ * $httpStatus/$envelope, never runs before a security check has already
+ * completed, and an audit-write failure (fail-open, see the doc's §13)
+ * can never change the response that is returned.
+ *
  * Deliberately HTTP-transport-independent: handle() takes plain scalar
  * inputs (method, content type, Authorization header value, raw body
  * string) rather than reading $_SERVER/php://input directly, so this
@@ -80,6 +92,13 @@ final class ExecuteRequestHandler {
 	private AccessKeyValidator $validator;
 	private CommandAdapter $adapter;
 	private RateLimiter $rateLimiter;
+	private AuditLogger $auditLogger;
+
+	/** @var callable(): float */
+	private $clock;
+
+	/** @var callable(): string */
+	private $requestIdGenerator;
 
 	/** @var string[] */
 	private array $allowedOperations;
@@ -109,17 +128,45 @@ final class ExecuteRequestHandler {
 	 *        per request, so relying on this default in production would
 	 *        silently rate-limit nothing. See
 	 *        dev-docs/api-v2/API_V2_RATE_LIMITING_IMPLEMENTATION.md §9.
+	 * @param AuditLogger|null $auditLogger Sprint 6. Defaults to a real
+	 *        FileAuditLogger pointed at its own real, production,
+	 *        installer-provisioned path — deliberately NOT a permissive
+	 *        no-op default (see this class's own docblock and
+	 *        AuditLogger's own). Safe for every pre-Sprint-6 test:
+	 *        that directory does not exist in a test environment, every
+	 *        write fails, and the fail-open policy below simply means no
+	 *        event is recorded — it never raises, never affects the
+	 *        response. Production (web/api/v2/index.php) relies on this
+	 *        very default rather than constructing its own, since the
+	 *        production path IS this class's own default.
+	 * @param callable(): float|null $clock Test-only injected clock,
+	 *        mirroring CommandAdapter's own convention — used only to
+	 *        compute AuditEvent's timestamp/duration_ms deterministically
+	 *        in tests.
+	 * @param callable(): string|null $requestIdGenerator Test-only
+	 *        injected id generator, mirroring CommandAdapter's own
+	 *        $idGenerator convention.
 	 */
 	public function __construct(
 		AccessKeyValidator $validator,
 		CommandAdapter $adapter,
 		?array $allowedOperations = null,
-		?RateLimiter $rateLimiter = null
+		?RateLimiter $rateLimiter = null,
+		?AuditLogger $auditLogger = null,
+		?callable $clock = null,
+		?callable $requestIdGenerator = null
 	) {
 		$this->validator = $validator;
 		$this->adapter = $adapter;
 		$this->allowedOperations = $allowedOperations ?? OperationAllowlist::ALLOWED_OPERATIONS;
 		$this->rateLimiter = $rateLimiter ?? new RateLimiter(new InMemoryRateLimitStore());
+		$this->auditLogger = $auditLogger ?? new FileAuditLogger();
+		$this->clock = $clock ?? static function (): float {
+			return microtime(true);
+		};
+		$this->requestIdGenerator = $requestIdGenerator ?? static function (): string {
+			return bin2hex(random_bytes(16));
+		};
 	}
 
 	/**
@@ -136,7 +183,15 @@ final class ExecuteRequestHandler {
 	 * @return array{0: int, 1: array<string, mixed>} [$httpStatus, $envelope]
 	 */
 	public function handle(string $method, string $contentType, ?string $authorizationHeader, string $rawBody, string $clientIp = ""): array {
+		$requestId = ($this->requestIdGenerator)();
+		$startedAt = ($this->clock)();
+
 		$operation = null;
+		$attemptedOperation = null;
+		$attemptedCredentialId = null;
+		$credentialId = null;
+		$actorUser = null;
+		$target = null;
 
 		try {
 			// Pre-authentication rate limiting runs before ANY other
@@ -156,11 +211,25 @@ final class ExecuteRequestHandler {
 			$this->assertBodySize($rawBody);
 			$body = $this->decodeJson($rawBody);
 
+			if (is_string($body["operation"] ?? null)) {
+				// Sprint 6: captured purely for audit purposes — the
+				// raw, caller-supplied operation string, even when it
+				// turns out to be unknown/not-allowlisted below. Never
+				// used for anything else: resolveOperation() below still
+				// performs its own, unrelated allowlist check and is the
+				// only thing that ever sets $operation itself.
+				$attemptedOperation = $body["operation"];
+			}
+
+			$credentials = $this->extractBasicCredentials($authorizationHeader);
+			$attemptedCredentialId = $credentials[0] ?? null;
+
 			// Authentication strictly before operation resolution — an
 			// unauthenticated request never reaches CommandAdapter, and
 			// never even learns whether its requested operation exists
 			// (§12's own enforced invariant).
-			[$credentialId, $actor] = $this->authenticate($authorizationHeader);
+			[$credentialId, $actor] = $this->authenticateWithCredentials($credentials);
+			$actorUser = $actor["user"];
 
 			// Authenticated rate limiting: only reached once
 			// authenticate() has already succeeded, keyed by the
@@ -174,11 +243,20 @@ final class ExecuteRequestHandler {
 			$params = $this->validateOperationParameters($operation, $params);
 			$params = ParameterNormalizer::normalize($operation, $params);
 
-			$result = $this->adapter->invoke($operation, $params, $actor);
+			// Sprint 6: the audit target is redacted from exactly the
+			// params CommandAdapter is about to receive — never from
+			// anything earlier/unvalidated. Set here, before invoke(),
+			// so it is still available for the audit event below no
+			// matter how invoke() itself concludes (success,
+			// authorization denial, Hestia failure, or an unexpected
+			// exception).
+			$target = AuditTargetRedactor::redact($operation, $params);
 
-			return ResponseMapper::fromAdapterResult($result);
+			$adapterResult = $this->adapter->invoke($operation, $params, $actor);
+
+			$result = ResponseMapper::fromAdapterResult($adapterResult);
 		} catch (ApiException $exception) {
-			return ResponseMapper::fromApiException($operation ?? "", $exception);
+			$result = ResponseMapper::fromApiException($operation ?? "", $exception);
 		} catch (\Throwable $exception) {
 			// Anything NOT already classified as an ApiException is an
 			// unexpected/programmer failure, not an expected operational
@@ -189,10 +267,76 @@ final class ExecuteRequestHandler {
 			// is deliberately NEVER included in the response — it may
 			// contain a filesystem path or other internal detail (§19) —
 			// only this fixed, generic message is ever returned.
-			return ResponseMapper::fromApiException(
+			$result = ResponseMapper::fromApiException(
 				$operation ?? "",
 				new ApiException("INTERNAL_ERROR", 500, "An internal error occurred.")
 			);
+		}
+
+		$this->recordAudit(
+			$requestId,
+			$startedAt,
+			$attemptedCredentialId,
+			$credentialId,
+			$actorUser,
+			$clientIp,
+			$operation ?? $attemptedOperation,
+			$target,
+			$result
+		);
+
+		return $result;
+	}
+
+	/**
+	 * @param array{0: int, 1: array<string, mixed>} $result
+	 */
+	private function recordAudit(
+		string $requestId,
+		float $startedAt,
+		?string $attemptedCredentialId,
+		?string $credentialId,
+		?string $actorUser,
+		string $clientIp,
+		?string $operation,
+		?array $target,
+		array $result
+	): void {
+		[$httpStatus, $envelope] = $result;
+		$durationMs = (int) round((($this->clock)() - $startedAt) * 1000);
+
+		$event = new AuditEvent(
+			gmdate("c"),
+			AuditEvent::eventTypeFor($envelope["success"], $envelope["error"]["code"] ?? null),
+			$requestId,
+			$attemptedCredentialId,
+			$credentialId,
+			$actorUser,
+			$clientIp !== "" ? $clientIp : null,
+			$operation,
+			$target,
+			$httpStatus,
+			$envelope["outcome"],
+			$envelope["success"],
+			$envelope["error"]["code"] ?? null,
+			$envelope["error"]["details"]["hestia_error_code"] ?? null,
+			$durationMs
+		);
+
+		// Fail-open (see dev-docs/api-v2/API_V2_AUDIT_LOGGING_IMPLEMENTATION.md
+		// §13): an audit-write failure must never change, delay, or
+		// retry the already-computed API response — $result above was
+		// already fully built before this method was ever called, and
+		// nothing below can influence it.
+		try {
+			$this->auditLogger->write($event);
+		} catch (AuditWriteException $exception) {
+			// Deliberately swallowed — see the doc's §13 for why no
+			// safe, sufficiently low-noise detection mechanism was
+			// implemented this sprint (this is called on literally
+			// every request, including this project's own several
+			// hundred pre-Sprint-6 tests, which never provision the
+			// production audit directory).
 		}
 	}
 
@@ -249,10 +393,15 @@ final class ExecuteRequestHandler {
 	}
 
 	/**
+	 * @param array{0: string, 1: string}|null $credentials Already
+	 *        extracted by extractBasicCredentials() — Sprint 6 needs the
+	 *        attempted credential id (credentials[0]) for the audit
+	 *        event regardless of whether authentication then succeeds,
+	 *        so extraction now happens once in handle() rather than
+	 *        being re-derived here.
 	 * @return array{0: string, 1: array{user: string}} [$credentialId, $actor]
 	 */
-	private function authenticate(?string $authorizationHeader): array {
-		$credentials = $this->extractBasicCredentials($authorizationHeader);
+	private function authenticateWithCredentials(?array $credentials): array {
 		if ($credentials === null) {
 			throw $this->authenticationFailed();
 		}
@@ -264,8 +413,9 @@ final class ExecuteRequestHandler {
 		}
 
 		// $id is returned solely as the Sprint 5 authenticated
-		// rate-limit bucket key — it is never merged into $actor, which
-		// remains exactly {user: ...}, unchanged from Sprints 1-4.
+		// rate-limit bucket key (and, since Sprint 6, the audit event's
+		// credential_id) — it is never merged into $actor, which remains
+		// exactly {user: ...}, unchanged from Sprints 1-4.
 		return [$id, ["user" => $user]];
 	}
 

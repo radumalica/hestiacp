@@ -93,6 +93,14 @@ try {
 	// PHP-FPM/CGI deployment uses per request, so only an explicit,
 	// filesystem-backed store actually rate-limits anything here. See
 	// dev-docs/api-v2/API_V2_RATE_LIMITING_IMPLEMENTATION.md §9.
+	//
+	// No AuditLogger argument is passed — unlike RateLimiter above, this
+	// is deliberate rather than an oversight: ExecuteRequestHandler's
+	// own default (see its constructor's own docblock) already
+	// constructs a real FileAuditLogger pointed at the real production
+	// audit path, so omitting it here IS the correct production wiring,
+	// not a fallback that silently disables anything. See
+	// dev-docs/api-v2/API_V2_AUDIT_LOGGING_IMPLEMENTATION.md §9.
 	$handler = new ExecuteRequestHandler(
 		new AccessKeyValidator(),
 		new CommandAdapter(new CommandRegistry(), new ProcOpenProcessRunner()),

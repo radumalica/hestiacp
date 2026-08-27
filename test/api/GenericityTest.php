@@ -37,6 +37,11 @@ final class GenericityTest {
 		"InMemoryRateLimitStore.php",
 		"FilesystemRateLimitStore.php",
 		"RateLimiter.php",
+		"AuditEvent.php",
+		"AuditLogger.php",
+		"AuditWriteException.php",
+		"AuditTargetRedactor.php",
+		"FileAuditLogger.php",
 	];
 
 	public static function register(MiniTest $t): void {
@@ -44,6 +49,7 @@ final class GenericityTest {
 		$t->test("API v2 source references no bin/v-* script name", [self::class, "testNoScriptNameReference"]);
 		$t->test("API v2 entry point (web/api/v2/index.php) performs no shell execution", [self::class, "testEntryPointNoShellExecution"]);
 		$t->test("API v2 entry point references no bin/v-* script name", [self::class, "testEntryPointNoScriptNameReference"]);
+		$t->test("Sprint 6: AuditEvent declares no property capable of holding a secret/password/header/raw-body value", [self::class, "testAuditEventModelDeclaresNoSensitiveFields"]);
 	}
 
 	public static function testNoShellExecution(): void {
@@ -97,5 +103,24 @@ final class GenericityTest {
 			preg_match('/\bv-[a-z]/', $source) !== 1,
 			"$label must never reference a bin/v-* script name directly — only CommandRegistry may resolve an operation to a script"
 		);
+	}
+
+	/**
+	 * Sprint 6, per the audit logging doc's own §17: a structural
+	 * guarantee that AuditEvent's MODEL cannot hold a raw secret even in
+	 * principle — never a property named for one of these values, on
+	 * top of (not instead of) the runtime tests in
+	 * test/api/AuditLoggerTest.php that prove no such value ever
+	 * actually reaches a written event.
+	 */
+	public static function testAuditEventModelDeclaresNoSensitiveFields(): void {
+		$source = file_get_contents(__DIR__ . "/../../web/inc/api/AuditEvent.php");
+
+		foreach (["secret", "password", "authorizationHeader", "rawBody"] as $forbiddenPropertyName) {
+			assertFalse(
+				strpos($source, "\$" . $forbiddenPropertyName) !== false,
+				"AuditEvent.php must never declare or reference a \$$forbiddenPropertyName property — the audit model must have no field capable of holding it"
+			);
+		}
 	}
 }

@@ -1,0 +1,264 @@
+<?php
+
+namespace Hestiacp\Api;
+
+use Hestiacp\Adapter\CommandAdapter;
+use Hestiacp\Auth\AccessKeyValidator;
+
+/**
+ * Implements the POST /api/v2/execute contract end to end, per
+ * dev-docs/api-v2/API_V2_HTTP_CONTRACT_DESIGN.md §6-§16, strictly
+ * following the pipeline ordering §12 defines:
+ *
+ *   parse -> authenticate -> resolve operation -> validate request
+ *     -> normalize target -> CommandAdapter::invoke()
+ *       -> resolve -> validate -> normalize -> authorize -> lock -> execute
+ *
+ * Deliberately HTTP-transport-independent: handle() takes plain scalar
+ * inputs (method, content type, Authorization header value, raw body
+ * string) rather than reading $_SERVER/php://input directly, so this
+ * class is exercised entirely through PHP function calls in tests — no
+ * real HTTP server, no real credential storage beyond an injected temp
+ * directory (matching AccessKeyValidatorTest/AccessKeyProvisionerTest's
+ * own established convention), and no real bin/v-* script (via
+ * CommandAdapter's own existing FakeProcessRunner injection point).
+ *
+ * Contains ZERO command-execution logic of its own: every operational
+ * outcome comes from exactly one CommandAdapter::invoke() call; this
+ * class never spawns a shell command or subprocess of any kind (no
+ * process-execution PHP function appears anywhere in its own source),
+ * and references no bin/v-* script name anywhere in its own source
+ * either.
+ *
+ * DEVIATION from a literal reading of §8/§10 (documented in full in
+ * dev-docs/api-v2/API_V2_HTTP_ENTRY_POINT_IMPLEMENTATION.md
+ * "Deviations"): those sections' prose says a caller-supplied "user"
+ * field anywhere in `params` must be rejected outright. Read literally,
+ * this would make every registered operation permanently uncallable,
+ * since every one of CommandRegistry's seven entries declares a
+ * required "user" parameter (the resource owner) — a different concept
+ * from actor.user (the authenticated identity), which SameUserAuthorizer
+ * already exists specifically to compare against it. §22's own
+ * acceptance criterion #3 states the real, testable requirement
+ * precisely and without that contradiction: "actor.user is never derived
+ * from anything but AccessKeyValidator::authenticate()'s return value...
+ * a `user`/`actor` field inside `params` has zero effect on the
+ * resulting `actor`." This class implements exactly that: `actor` is
+ * built solely from authenticate() below and is never read from, or
+ * merged with, $body/$params at any point. A literal `actor` field
+ * anywhere at the request's top level is rejected by
+ * validateEnvelope()'s unknown-top-level-field check; a `params.actor`
+ * (or any other key an operation's registry entry does not declare) is
+ * rejected by CommandAdapter's own existing UNEXPECTED_PARAMETER check —
+ * both without this class needing any operation-specific field-name
+ * denylist.
+ */
+final class ExecuteRequestHandler {
+	private AccessKeyValidator $validator;
+	private CommandAdapter $adapter;
+
+	/** @var string[] */
+	private array $allowedOperations;
+
+	/**
+	 * @param string[]|null $allowedOperations Test-only extension point,
+	 *        mirroring CommandRegistry's own established
+	 *        "$additionalOperations... no production caller passes this
+	 *        argument" convention (web/inc/adapter/CommandRegistry.php).
+	 *        Defaults to OperationAllowlist::ALLOWED_OPERATIONS — the
+	 *        real, single source of truth for production. Tests use this
+	 *        to exercise the full pipeline (including
+	 *        authorization/lock-ordering invariants) against a synthetic
+	 *        mutating operation without this sprint exposing one in
+	 *        production (web/api/v2/index.php never passes this
+	 *        argument).
+	 */
+	public function __construct(AccessKeyValidator $validator, CommandAdapter $adapter, ?array $allowedOperations = null) {
+		$this->validator = $validator;
+		$this->adapter = $adapter;
+		$this->allowedOperations = $allowedOperations ?? OperationAllowlist::ALLOWED_OPERATIONS;
+	}
+
+	/**
+	 * @return array{0: int, 1: array<string, mixed>} [$httpStatus, $envelope]
+	 */
+	public function handle(string $method, string $contentType, ?string $authorizationHeader, string $rawBody): array {
+		$operation = null;
+
+		try {
+			$this->assertMethod($method);
+			$this->assertContentType($contentType);
+			$body = $this->decodeJson($rawBody);
+
+			// Authentication strictly before operation resolution — an
+			// unauthenticated request never reaches CommandAdapter, and
+			// never even learns whether its requested operation exists
+			// (§12's own enforced invariant).
+			$actor = $this->authenticate($authorizationHeader);
+
+			$operation = $this->resolveOperation($body);
+			$params = $this->validateEnvelope($body);
+			$params = ParameterNormalizer::normalize($operation, $params);
+
+			$result = $this->adapter->invoke($operation, $params, $actor);
+
+			return ResponseMapper::fromAdapterResult($result);
+		} catch (ApiException $exception) {
+			return ResponseMapper::fromApiException($operation ?? "", $exception);
+		} catch (\Throwable $exception) {
+			// Anything NOT already classified as an ApiException is an
+			// unexpected/programmer failure, not an expected operational
+			// one (see this class's own docblock and
+			// API_V2_HTTP_CONTRACT_DESIGN.md §14's own INTERNAL_ERROR
+			// entry, which explicitly covers "a genuine unexpected
+			// exception at the HTTP layer itself"). $exception->getMessage()
+			// is deliberately NEVER included in the response — it may
+			// contain a filesystem path or other internal detail (§19) —
+			// only this fixed, generic message is ever returned.
+			return ResponseMapper::fromApiException(
+				$operation ?? "",
+				new ApiException("INTERNAL_ERROR", 500, "An internal error occurred.")
+			);
+		}
+	}
+
+	private function assertMethod(string $method): void {
+		if ($method !== "POST") {
+			throw new ApiException("METHOD_NOT_ALLOWED", 405, "Only POST is supported for this endpoint.");
+		}
+	}
+
+	private function assertContentType(string $contentType): void {
+		$parts = explode(";", $contentType);
+		$normalized = strtolower(trim($parts[0]));
+		if ($normalized !== "application/json") {
+			throw new ApiException("UNSUPPORTED_MEDIA_TYPE", 415, "Content-Type must be application/json.");
+		}
+	}
+
+	/** @return array<string, mixed> */
+	private function decodeJson(string $rawBody): array {
+		$decoded = json_decode($rawBody, true);
+		if (json_last_error() !== JSON_ERROR_NONE || !is_array($decoded)) {
+			throw new ApiException("MALFORMED_JSON", 400, "Request body is not valid JSON.");
+		}
+		return $decoded;
+	}
+
+	/** @return array{user: string} */
+	private function authenticate(?string $authorizationHeader): array {
+		$credentials = $this->extractBasicCredentials($authorizationHeader);
+		if ($credentials === null) {
+			throw $this->authenticationFailed();
+		}
+
+		[$id, $secret] = $credentials;
+		$user = $this->validator->authenticate($id, $secret);
+		if ($user === null) {
+			throw $this->authenticationFailed();
+		}
+
+		return ["user" => $user];
+	}
+
+	private function authenticationFailed(): ApiException {
+		// Deliberately the SAME code/message/status for every
+		// authentication failure reason (missing header, malformed
+		// header, unknown credential id, wrong secret, revoked
+		// credential) — §7's own existence-non-disclosure requirement,
+		// inherited unchanged from AccessKeyValidator::authenticate()'s
+		// own collapsed ?string contract.
+		return new ApiException("AUTHENTICATION_FAILED", 401, "Authentication failed.");
+	}
+
+	/** @return array{0: string, 1: string}|null */
+	private function extractBasicCredentials(?string $header): ?array {
+		if ($header === null || $header === "") {
+			return null;
+		}
+		if (stripos($header, "Basic ") !== 0) {
+			return null;
+		}
+
+		$encoded = trim(substr($header, 6));
+		$decoded = base64_decode($encoded, true);
+		if ($decoded === false) {
+			return null;
+		}
+
+		$separator = strpos($decoded, ":");
+		if ($separator === false) {
+			return null;
+		}
+
+		$id = substr($decoded, 0, $separator);
+		$secret = substr($decoded, $separator + 1);
+		if ($id === "") {
+			return null;
+		}
+
+		return [$id, $secret];
+	}
+
+	/** @param array<string, mixed> $body */
+	private function resolveOperation(array $body): string {
+		$operation = $body["operation"] ?? null;
+		if (!is_string($operation) || $operation === "") {
+			throw new ApiException("VALIDATION_FAILED", 422, "A non-empty 'operation' field is required.");
+		}
+		if (!in_array($operation, $this->allowedOperations, true)) {
+			// Deliberately generic — never reveals whether "operation"
+			// exists as an internal (but non-public) adapter operation
+			// (§9: allowlist membership is the only question this
+			// answers).
+			throw new ApiException("OPERATION_NOT_ALLOWED", 404, "Unknown API operation.");
+		}
+		return $operation;
+	}
+
+	/**
+	 * @param array<string, mixed> $body
+	 * @return array<string, mixed>
+	 */
+	private function validateEnvelope(array $body): array {
+		$unknownKeys = array_diff(array_keys($body), ["operation", "params"]);
+		if (!empty($unknownKeys)) {
+			throw new ApiException(
+				"VALIDATION_FAILED",
+				422,
+				"Unknown top-level field(s): " . implode(", ", $unknownKeys)
+			);
+		}
+
+		if (!array_key_exists("params", $body)) {
+			throw new ApiException("VALIDATION_FAILED", 422, "A 'params' field is required.");
+		}
+
+		$params = $body["params"];
+		if (!is_array($params) || self::isList($params)) {
+			throw new ApiException("VALIDATION_FAILED", 422, "'params' must be a JSON object.");
+		}
+
+		// §10: a null value for a declared params field is treated as
+		// "not provided" (absent), not as a distinct value — matching
+		// SensitiveParameterTest.php's already-established convention,
+		// applied here at the envelope layer so CommandAdapter's own
+		// array_key_exists()-based "was a value supplied" check sees an
+		// absent key, not a present null.
+		foreach ($params as $key => $value) {
+			if ($value === null) {
+				unset($params[$key]);
+			}
+		}
+
+		return $params;
+	}
+
+	/** @param array<int|string, mixed> $value */
+	private static function isList(array $value): bool {
+		if ($value === []) {
+			return false;
+		}
+		return array_keys($value) === range(0, count($value) - 1);
+	}
+}

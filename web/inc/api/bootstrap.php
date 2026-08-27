@@ -16,6 +16,7 @@
 
 require_once __DIR__ . "/ApiException.php";
 require_once __DIR__ . "/OperationAllowlist.php";
+require_once __DIR__ . "/OperationParameterContract.php";
 require_once __DIR__ . "/ParameterNormalizer.php";
 require_once __DIR__ . "/ResponseMapper.php";
 require_once __DIR__ . "/ExecuteRequestHandler.php";

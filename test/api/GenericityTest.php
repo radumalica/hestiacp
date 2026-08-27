@@ -27,6 +27,7 @@ final class GenericityTest {
 	private const API_SOURCE_FILES = [
 		"ApiException.php",
 		"OperationAllowlist.php",
+		"OperationParameterContract.php",
 		"ParameterNormalizer.php",
 		"ResponseMapper.php",
 		"ExecuteRequestHandler.php",

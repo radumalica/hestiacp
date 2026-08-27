@@ -98,6 +98,7 @@ final class ExecuteRequestHandler {
 
 			$operation = $this->resolveOperation($body);
 			$params = $this->validateEnvelope($body);
+			$params = $this->validateOperationParameters($operation, $params);
 			$params = ParameterNormalizer::normalize($operation, $params);
 
 			$result = $this->adapter->invoke($operation, $params, $actor);
@@ -248,6 +249,47 @@ final class ExecuteRequestHandler {
 		foreach ($params as $key => $value) {
 			if ($value === null) {
 				unset($params[$key]);
+			}
+		}
+
+		return $params;
+	}
+
+	/**
+	 * Name-level parameter contract check (Sprint 3,
+	 * OperationParameterContract) — rejects any params key not
+	 * explicitly declared public for this operation, and any declared
+	 * required key that is missing. Runs after envelope validation
+	 * (§10) and before normalization, so normalization only ever
+	 * operates on an already name-validated params set. Performs no
+	 * value/type/shape checking of its own — see
+	 * OperationParameterContract's own docblock for why that stays
+	 * CommandAdapter's job.
+	 *
+	 * @param array<string, mixed> $params
+	 * @return array<string, mixed>
+	 */
+	private function validateOperationParameters(string $operation, array $params): array {
+		if (!OperationParameterContract::isDeclared($operation)) {
+			return $params;
+		}
+
+		$unknownKeys = array_diff(array_keys($params), OperationParameterContract::allowedParameters($operation));
+		if (!empty($unknownKeys)) {
+			throw new ApiException(
+				"VALIDATION_FAILED",
+				422,
+				"Unknown parameter(s) for '" . $operation . "': " . implode(", ", $unknownKeys)
+			);
+		}
+
+		foreach (OperationParameterContract::requiredParameters($operation) as $name) {
+			if (!array_key_exists($name, $params)) {
+				throw new ApiException(
+					"VALIDATION_FAILED",
+					422,
+					"Missing required parameter '" . $name . "' for '" . $operation . "'."
+				);
 			}
 		}
 

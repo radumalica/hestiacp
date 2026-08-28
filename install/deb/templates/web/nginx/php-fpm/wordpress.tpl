@@ -39,7 +39,36 @@ server {
 			fastcgi_hide_header "Set-Cookie";
 		}
 
-		location ~* /(?:uploads|files)/.*.php$ {
+		# WordPress security profile (baseline, always on for this
+		# template): block direct access to files that never need to be
+		# requested over HTTP but commonly leak configuration/version
+		# information if left reachable. Safe for stock WordPress, every
+		# major plugin, and WooCommerce — none of these paths are ever
+		# legitimately fetched by a browser/REST client; wp-config.php
+		# itself is never served by WordPress's own routing either (PHP
+		# always includes it, never requests it as a URL). Nested inside
+		# location / (not a server-level sibling) so it reliably takes
+		# priority over the general PHP-execution location below —
+		# empirically confirmed during Sprint 8 testing that a
+		# server-level regex location here can lose to a nested regex
+		# location matching the same URI; nesting matches nginx's own
+		# location-matching resolution for this exact case.
+		location ~* ^/(?:wp-config\.php|wp-config-sample\.php|readme\.html|license\.txt|wp-content/debug\.log)$ {
+			deny all;
+			return 404;
+		}
+
+		# WordPress security profile: PHP execution is never legitimate
+		# inside wp-content/uploads (WordPress's own media library) or
+		# wp-content/cache (written by every major caching plugin) —
+		# both are writable-by-the-app directories, the classic path for
+		# an uploaded/planted PHP file to be executed. This rejects the
+		# request at the Nginx boundary (before PHP-FPM ever runs) and
+		# never touches, moves, or deletes anything on disk. Deliberately
+		# scoped to these two directories only — wp-admin, wp-includes,
+		# and wp-content/plugins/themes all legitimately execute PHP and
+		# are untouched by this rule.
+		location ~* ^/wp-content/(?:uploads|cache)/.*\.php$ {
 			deny all;
 			return 404;
 		}
@@ -78,5 +107,19 @@ server {
 
 	include /etc/nginx/conf.d/phpmyadmin.inc*;
 	include /etc/nginx/conf.d/phppgadmin.inc*;
+
+	# Composable feature extension point (Sprint 8 —
+	# dev-docs/nginx/NGINX_SECURITY_EXTENSIBILITY_IMPLEMENTATION.md):
+	# any file an administrator places at
+	# %home%/%user%/conf/web/%domain%/nginx.features.conf_<name> is
+	# included here automatically. This is how optional, composable
+	# features (security headers, rate limiting, a WAF/ruleset provider,
+	# a cache policy, a future application profile add-on) are enabled
+	# per domain, without ever editing this template. Matches zero files
+	# — and therefore changes nothing — until a feature snippet is
+	# actually placed here; see install/deb/templates/web/nginx/snippets/
+	# for the reference snippets shipped this sprint.
+	include %home%/%user%/conf/web/%domain%/nginx.features.conf_*;
+
 	include %home%/%user%/conf/web/%domain%/nginx.conf_*;
 }

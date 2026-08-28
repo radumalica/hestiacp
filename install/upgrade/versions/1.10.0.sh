@@ -55,6 +55,31 @@ chmod 700 "$HESTIA/data/api-v2-audit"
 echo "[ * ] Fix File Manager ignoring user language"
 cp -f "$HESTIA"/install/deb/filemanager/filegator/configuration.php "$HESTIA"/web/fm/configuration.php
 
+# Sprint 8 (dev-docs/nginx/NGINX_SECURITY_EXTENSIBILITY_IMPLEMENTATION.md):
+# backfill the composable Nginx feature architecture for installations
+# upgrading through this version. UPGRADE_UPDATE_WEB_TEMPLATES is set to
+# 'false' above (predates this sprint; left untouched here so this
+# release doesn't also force an unrelated, full resync of every other
+# app's web templates), so upgrade_rebuild_web_templates() will not run
+# v-update-web-templates for this hop. These two targeted copies mirror
+# the "Fix File Manager" pattern immediately above: copy only the
+# specific files this sprint changed/added, the same way v-update-web-
+# templates itself would, without touching any other template.
+echo "[ * ] Updating WordPress Nginx templates with security profile"
+cp -f "$HESTIA"/install/deb/templates/web/nginx/php-fpm/wordpress.tpl "$HESTIA"/data/templates/web/nginx/php-fpm/wordpress.tpl
+cp -f "$HESTIA"/install/deb/templates/web/nginx/php-fpm/wordpress.stpl "$HESTIA"/data/templates/web/nginx/php-fpm/wordpress.stpl
+mkdir -p "$HESTIA"/data/templates/web/nginx/snippets
+cp -f "$HESTIA"/install/deb/templates/web/nginx/snippets/*.conf "$HESTIA"/data/templates/web/nginx/snippets/
+cp -f "$HESTIA"/install/deb/templates/web/nginx/snippets/README.md "$HESTIA"/data/templates/web/nginx/snippets/
+
+# New global, dormant-by-default rate-limit zone declaration (see
+# install/deb/nginx/hestia-rate-limit.conf) - no existing upgrade
+# mechanism syncs individual files under install/deb/nginx/ to
+# /etc/nginx/conf.d/, so this must be backfilled explicitly, same as
+# status.conf/agents.conf were for earlier releases.
+echo "[ * ] Installing Nginx rate-limit zone declaration"
+cp -f "$HESTIA"/install/deb/nginx/hestia-rate-limit.conf /etc/nginx/conf.d/
+
 if [ -f /etc/os-release ]; then
 	source /etc/os-release
 fi

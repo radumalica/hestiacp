@@ -1614,6 +1614,12 @@ cp -f $HESTIA_INSTALL_DIR/nginx/nginx.conf /etc/nginx/
 cp -f $HESTIA_INSTALL_DIR/nginx/status.conf /etc/nginx/conf.d/
 cp -f $HESTIA_INSTALL_DIR/nginx/0rtt-anti-replay.conf /etc/nginx/conf.d/
 cp -f $HESTIA_INSTALL_DIR/nginx/agents.conf /etc/nginx/conf.d/
+# Global, dormant-by-default rate-limit zone for the composable Nginx
+# feature architecture (Sprint 8) — see
+# dev-docs/nginx/NGINX_SECURITY_EXTENSIBILITY_IMPLEMENTATION.md. Declares
+# a zone only; has no effect on any domain unless a domain's own config
+# explicitly references it (install/deb/templates/web/nginx/snippets/rate-limit-example.conf).
+cp -f $HESTIA_INSTALL_DIR/nginx/hestia-rate-limit.conf /etc/nginx/conf.d/
 # Copy over cloudflare.inc incase in the next step there are connection issues with CF
 cp -f $HESTIA_INSTALL_DIR/nginx/cloudflare.inc /etc/nginx/conf.d/
 cp -f $HESTIA_INSTALL_DIR/nginx/phpmyadmin.inc /etc/nginx/conf.d/

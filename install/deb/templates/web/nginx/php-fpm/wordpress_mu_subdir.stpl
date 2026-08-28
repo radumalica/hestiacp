@@ -56,13 +56,42 @@ server {
 			fastcgi_hide_header "Set-Cookie";
 		}
 
-		location ~* /(?:uploads|files)/.*.php$ {
+		# WordPress security profile — sensitive files (Sprint 9A; see
+		# wordpress.tpl for full rationale). Nested inside location / so it
+		# takes priority over the general PHP-execution location below.
+		location ~* ^/(?:wp-config\.php(?:\.(?:bak|save|old|orig|swp)|~)?|wp-config-sample\.php|readme\.html|license\.txt|wp-content/debug\.log|[^/]+\.sql(?:\.gz)?)$ {
+			deny all;
+			return 404;
+		}
+
+		# WordPress security profile — deny PHP execution in
+		# wp-content/uploads and wp-content/cache (Sprint 9A; see
+		# wordpress.tpl for full rationale). Supersedes this variant's
+		# previous, narrower uploads|files rule. This variant needs a
+		# broader pattern than the others for two reasons, both empirically
+		# verified with a live nginx instance: (1) a subsite path such as
+		# /blogname/wp-content/uploads/evil.php must be denied — a planted
+		# file bypasses the rewrite above (it only fires when the file does
+		# not already exist), so the leading site slug is optional here,
+		# same [_0-9a-zA-Z-]+ charset as the rewrite rule; (2) for the ROOT
+		# site specifically, when no file exists yet at the requested path,
+		# this file's own rewrite rule (`rewrite ^/[_0-9a-zA-Z-]+(/.*\.php)$
+		# $1 last;`) misidentifies "wp-content" itself as if it were a site
+		# slug and strips it, turning /wp-content/uploads/evil.php into
+		# /uploads/evil.php before this location ever sees it — so
+		# "wp-content/" must be optional too, not just the site slug.
+		location ~* ^/(?:(?:[_0-9a-zA-Z-]+/)?wp-content/)?(?:uploads|cache)/.*\.php$ {
 			deny all;
 			return 404;
 		}
 
 		location ~ [^/]\.php(/|$) {
 			try_files $uri =404;
+
+			# WordPress auth-endpoint rate limiting (Sprint 9A) — see
+			# hestia-wp-auth-rate-limit.conf for the zone/map and
+			# wordpress.tpl for full rationale.
+			limit_req zone=hestia_wp_auth_rl burst=15 nodelay;
 
 			include /etc/nginx/fastcgi_params;
 
@@ -96,5 +125,11 @@ server {
 
 	include /etc/nginx/conf.d/phpmyadmin.inc*;
 	include /etc/nginx/conf.d/phppgadmin.inc*;
+
+	# Composable feature extension point (Sprint 8) — see wordpress.stpl
+	# for full documentation. Matches zero files until an admin places a
+	# feature snippet here.
+	include %home%/%user%/conf/web/%domain%/nginx.features.ssl.conf_*;
+
 	include %home%/%user%/conf/web/%domain%/nginx.ssl.conf_*;
 }

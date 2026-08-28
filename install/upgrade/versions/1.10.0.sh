@@ -66,8 +66,15 @@ cp -f "$HESTIA"/install/deb/filemanager/filegator/configuration.php "$HESTIA"/we
 # specific files this sprint changed/added, the same way v-update-web-
 # templates itself would, without touching any other template.
 echo "[ * ] Updating WordPress Nginx templates with security profile"
-cp -f "$HESTIA"/install/deb/templates/web/nginx/php-fpm/wordpress.tpl "$HESTIA"/data/templates/web/nginx/php-fpm/wordpress.tpl
-cp -f "$HESTIA"/install/deb/templates/web/nginx/php-fpm/wordpress.stpl "$HESTIA"/data/templates/web/nginx/php-fpm/wordpress.stpl
+for _wp_tpl in \
+	wordpress.tpl wordpress.stpl \
+	wordpress-disable-xmlrpc.tpl wordpress-disable-xmlrpc.stpl \
+	wordpress-http3.tpl wordpress-http3.stpl \
+	wordpress_mu_subdir.tpl wordpress_mu_subdir.stpl \
+	wordpress-disable-xmlrpc-http3.tpl wordpress-disable-xmlrpc-http3.stpl \
+	wordpress_mu_subdir-http3.tpl wordpress_mu_subdir-http3.stpl; do
+	cp -f "$HESTIA"/install/deb/templates/web/nginx/php-fpm/"$_wp_tpl" "$HESTIA"/data/templates/web/nginx/php-fpm/"$_wp_tpl"
+done
 mkdir -p "$HESTIA"/data/templates/web/nginx/snippets
 cp -f "$HESTIA"/install/deb/templates/web/nginx/snippets/*.conf "$HESTIA"/data/templates/web/nginx/snippets/
 cp -f "$HESTIA"/install/deb/templates/web/nginx/snippets/README.md "$HESTIA"/data/templates/web/nginx/snippets/
@@ -79,6 +86,15 @@ cp -f "$HESTIA"/install/deb/templates/web/nginx/snippets/README.md "$HESTIA"/dat
 # status.conf/agents.conf were for earlier releases.
 echo "[ * ] Installing Nginx rate-limit zone declaration"
 cp -f "$HESTIA"/install/deb/nginx/hestia-rate-limit.conf /etc/nginx/conf.d/
+
+# WordPress auth-endpoint rate-limit zone (Sprint 9A — see
+# dev-docs/nginx/NGINX_WORDPRESS_HARDENING_IMPLEMENTATION.md). Unlike the
+# zone above, every WordPress template above now references this one
+# unconditionally, so it MUST be present before the templates it was just
+# backfilled together with are ever rebuilt, or `nginx -t` fails for every
+# WordPress domain on this server.
+echo "[ * ] Installing Nginx WordPress auth-endpoint rate-limit zone"
+cp -f "$HESTIA"/install/deb/nginx/hestia-wp-auth-rate-limit.conf /etc/nginx/conf.d/
 
 if [ -f /etc/os-release ]; then
 	source /etc/os-release

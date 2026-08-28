@@ -1620,6 +1620,12 @@ cp -f $HESTIA_INSTALL_DIR/nginx/agents.conf /etc/nginx/conf.d/
 # a zone only; has no effect on any domain unless a domain's own config
 # explicitly references it (install/deb/templates/web/nginx/snippets/rate-limit-example.conf).
 cp -f $HESTIA_INSTALL_DIR/nginx/hestia-rate-limit.conf /etc/nginx/conf.d/
+# WordPress auth-endpoint rate-limit zone (Sprint 9A) — see
+# dev-docs/nginx/NGINX_WORDPRESS_HARDENING_IMPLEMENTATION.md. Unlike the
+# zone above, every WordPress template references this one unconditionally
+# (scoped to /wp-login.php and /xmlrpc.php via a $request_uri map), so it
+# must always be installed or WordPress domains would fail `nginx -t`.
+cp -f $HESTIA_INSTALL_DIR/nginx/hestia-wp-auth-rate-limit.conf /etc/nginx/conf.d/
 # Copy over cloudflare.inc incase in the next step there are connection issues with CF
 cp -f $HESTIA_INSTALL_DIR/nginx/cloudflare.inc /etc/nginx/conf.d/
 cp -f $HESTIA_INSTALL_DIR/nginx/phpmyadmin.inc /etc/nginx/conf.d/

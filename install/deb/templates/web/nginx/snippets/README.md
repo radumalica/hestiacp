@@ -9,8 +9,11 @@ configuration, safe to `include` verbatim.
 ## How to enable one
 
 Copy (or symlink) the snippet into the domain's own configuration
-directory, using the extension point the `wordpress`/`wordpress-ssl`
-templates already provide:
+directory, using the extension point all 12 WordPress template variants
+provide (`wordpress`, `wordpress-disable-xmlrpc`, `wordpress-http3`,
+`wordpress_mu_subdir`, and their `.tpl`/`.stpl` and `-http3` combinations
+— extended to the full set in Sprint 9A; Sprint 8 originally added it to
+`wordpress.tpl`/`wordpress.stpl` only):
 
 ```
 cp security-headers.conf \
@@ -57,4 +60,17 @@ full architecture this extension point belongs to.
   for a ModSecurity/OWASP CRS integration. **Not usable as shipped**:
   no ModSecurity Nginx module is installed by this repository's
   installer. See the file's own comment and the implementation doc's
-  "Deferred work" section.
+  "Deferred work" section. Re-verified unchanged during Sprint 9A — see
+  `dev-docs/nginx/NGINX_WORDPRESS_HARDENING_IMPLEMENTATION.md`.
+
+## WordPress auth-endpoint rate limiting (Sprint 9A)
+
+Unlike everything above, WordPress's rate limit on `/wp-login.php` and
+`/xmlrpc.php` is **not** an opt-in snippet — it is a baseline, always-on
+single line (`limit_req zone=hestia_wp_auth_rl burst=15 nodelay;`) inside
+every WordPress template's own general PHP-execution location, because
+the zone it needs (`install/deb/nginx/hestia-wp-auth-rate-limit.conf`) is
+scoped by a `$request_uri` map, not by a location block, so there is
+nothing to duplicate a `fastcgi_pass` for and nothing to opt into per
+domain. See `dev-docs/nginx/NGINX_WORDPRESS_HARDENING_IMPLEMENTATION.md`
+for the full rationale and how to adjust its rate/burst.

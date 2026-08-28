@@ -39,13 +39,30 @@ server {
 			fastcgi_hide_header "Set-Cookie";
 		}
 
-		location ~* /(?:uploads|files)/.*.php$ {
+		# WordPress security profile — sensitive files (Sprint 9A; see
+		# wordpress.tpl for full rationale). Nested inside location / so it
+		# takes priority over the general PHP-execution location below.
+		location ~* ^/(?:wp-config\.php(?:\.(?:bak|save|old|orig|swp)|~)?|wp-config-sample\.php|readme\.html|license\.txt|wp-content/debug\.log|[^/]+\.sql(?:\.gz)?)$ {
+			deny all;
+			return 404;
+		}
+
+		# WordPress security profile — deny PHP execution in
+		# wp-content/uploads and wp-content/cache (Sprint 9A; see
+		# wordpress.tpl for full rationale). Supersedes this variant's
+		# previous, narrower uploads|files rule.
+		location ~* ^/wp-content/(?:uploads|cache)/.*\.php$ {
 			deny all;
 			return 404;
 		}
 
 		location ~ [^/]\.php(/|$) {
 			try_files $uri =404;
+
+			# WordPress auth-endpoint rate limiting (Sprint 9A) — see
+			# hestia-wp-auth-rate-limit.conf for the zone/map and
+			# wordpress.tpl for full rationale.
+			limit_req zone=hestia_wp_auth_rl burst=15 nodelay;
 
 			include /etc/nginx/fastcgi_params;
 
@@ -78,5 +95,11 @@ server {
 
 	include /etc/nginx/conf.d/phpmyadmin.inc*;
 	include /etc/nginx/conf.d/phppgadmin.inc*;
+
+	# Composable feature extension point (Sprint 8) — see wordpress.tpl for
+	# full documentation. Matches zero files until an admin places a
+	# feature snippet here.
+	include %home%/%user%/conf/web/%domain%/nginx.features.conf_*;
+
 	include %home%/%user%/conf/web/%domain%/nginx.conf_*;
 }

@@ -52,18 +52,22 @@ server {
 		# WordPress security profile (baseline, always on for this
 		# template): block direct access to files that never need to be
 		# requested over HTTP but commonly leak configuration/version
-		# information if left reachable. Safe for stock WordPress, every
-		# major plugin, and WooCommerce — none of these paths are ever
-		# legitimately fetched by a browser/REST client; wp-config.php
+		# information or data if left reachable. Safe for stock WordPress,
+		# every major plugin, and WooCommerce — none of these paths are
+		# ever legitimately fetched by a browser/REST client; wp-config.php
 		# itself is never served by WordPress's own routing either (PHP
-		# always includes it, never requests it as a URL). Nested inside
-		# location / (not a server-level sibling) so it reliably takes
-		# priority over the general PHP-execution location below —
+		# always includes it, never requests it as a URL). Also covers
+		# common backup/editor-leftover variants of wp-config.php and
+		# root-level SQL dump files (Sprint 9A — both frequent accidental-
+		# exposure patterns); .env is already covered by the dotfile-deny
+		# rule above, so it is deliberately not repeated here. Nested
+		# inside location / (not a server-level sibling) so it reliably
+		# takes priority over the general PHP-execution location below —
 		# empirically confirmed during Sprint 8 testing that a
 		# server-level regex location here can lose to a nested regex
 		# location matching the same URI; nesting matches nginx's own
 		# location-matching resolution for this exact case.
-		location ~* ^/(?:wp-config\.php|wp-config-sample\.php|readme\.html|license\.txt|wp-content/debug\.log)$ {
+		location ~* ^/(?:wp-config\.php(?:\.(?:bak|save|old|orig|swp)|~)?|wp-config-sample\.php|readme\.html|license\.txt|wp-content/debug\.log|[^/]+\.sql(?:\.gz)?)$ {
 			deny all;
 			return 404;
 		}
@@ -85,6 +89,16 @@ server {
 
 		location ~ [^/]\.php(/|$) {
 			try_files $uri =404;
+
+			# WordPress auth-endpoint rate limiting (Sprint 9A —
+			# dev-docs/nginx/NGINX_WORDPRESS_HARDENING_IMPLEMENTATION.md).
+			# The zone is scoped to /wp-login.php and /xmlrpc.php only, via
+			# a $request_uri map in hestia-wp-auth-rate-limit.conf; every
+			# other request maps to an empty key and is never rate-limited
+			# by this directive (empirically verified with a live nginx
+			# instance, not just `nginx -t`) — so this line has no effect
+			# on ordinary WordPress traffic.
+			limit_req zone=hestia_wp_auth_rl burst=15 nodelay;
 
 			include /etc/nginx/fastcgi_params;
 

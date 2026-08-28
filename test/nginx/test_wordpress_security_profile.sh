@@ -1,13 +1,15 @@
 #!/bin/bash
 #
 # Sprint 8 (dev-docs/nginx/NGINX_SECURITY_EXTENSIBILITY_IMPLEMENTATION.md)
+# and Sprint 9A (dev-docs/nginx/NGINX_WORDPRESS_HARDENING_IMPLEMENTATION.md)
 # standalone test suite for the composable Nginx feature architecture and
 # the WordPress security profile. Does not require a Hestia install —
 # renders the shipped templates through the same sed substitution
 # add_web_config() uses, then (if a local nginx binary is available)
 # validates the result with the real nginx binary: `nginx -t` for syntax,
-# and a short-lived nginx instance for behavioral checks (blocked paths
-# return 404 without reaching PHP-FPM, legitimate paths still do).
+# and short-lived nginx instances for behavioral checks (blocked paths
+# return 404 without reaching PHP-FPM, legitimate paths still do, and — new
+# in Sprint 9A — the auth-endpoint rate limit actually throttles).
 #
 # Usage: bash test/nginx/test_wordpress_security_profile.sh
 
@@ -150,6 +152,81 @@ openssl req -x509 -newkey rsa:2048 -nodes \
 cp "$WORKDIR/ssl/cert.pem" "$WORKDIR/ssl/combined.pem"
 cp "$WORKDIR/ssl/cert.pem" "$WORKDIR/ssl/ca.pem"
 
+# --- 5b. Template coverage (Sprint 9A, scope item #8): all 12 WordPress
+# template variants must render and pass `nginx -t`, not just wordpress.tpl/
+# .stpl. Each variant is rendered to its own file and syntax-checked in its
+# own minimal http{} block (not sharing a listen socket with anything else)
+# so a failure in one variant is attributed correctly.
+ALL_WP_TEMPLATES=(
+	wordpress
+	wordpress-disable-xmlrpc
+	wordpress-http3
+	wordpress_mu_subdir
+	wordpress-disable-xmlrpc-http3
+	wordpress_mu_subdir-http3
+)
+TPLDIR="$REPO_ROOT/install/deb/templates/web/nginx/php-fpm"
+COVERAGE_OK=1
+for base in "${ALL_WP_TEMPLATES[@]}"; do
+	for ext in tpl stpl; do
+		src="$TPLDIR/$base.$ext"
+		if [[ ! -f "$src" ]]; then
+			bad "expected template missing: $base.$ext"
+			COVERAGE_OK=0
+			continue
+		fi
+		out="$WORKDIR/coverage-$base.$ext.conf"
+		render_template "$src" "$out"
+		if [[ "$ext" == "tpl" ]]; then
+			sed -i "s|^\tlisten      127.0.0.1:18080;|\tlisten      unix:$WORKDIR/cov-$base-$ext.sock;|" "$out"
+		else
+			sed -i \
+				-e "s|^\tlisten      127.0.0.1:18443 ssl;|\tlisten      unix:$WORKDIR/cov-$base-$ext.sock ssl;|" \
+				-e "s|^\tlisten      127.0.0.1:18443 quic;|#quic-disabled-in-test\n|" \
+				"$out"
+		fi
+		if grep -q '%[a-z_]*%' "$out"; then
+			bad "unresolved template variable left in $base.$ext"
+			grep -n '%[a-z_]*%' "$out"
+			COVERAGE_OK=0
+			continue
+		fi
+		cat > "$WORKDIR/cov-master.conf" << EOF
+daemon off;
+worker_processes 1;
+error_log stderr;
+pid $WORKDIR/cov-nginx.pid;
+events { worker_connections 16; }
+http {
+	include /etc/nginx/mime.types;
+	default_type application/octet-stream;
+	access_log off;
+	log_format main '\$remote_addr - \$remote_user [\$time_local] \$request "\$status"';
+	log_format bytes '\$body_bytes_sent';
+	client_max_body_size 1024m;
+	fastcgi_cache_path $WORKDIR/cache/micro-cov levels=1:2 keys_zone=microcache_cov:10m inactive=30m max_size=1024m;
+	map \$http_cookie \$no_cache {
+		default 0;
+		~SESS 1;
+		~wordpress_logged_in 1;
+	}
+	include $REPO_ROOT/install/deb/nginx/0rtt-anti-replay.conf;
+	include $REPO_ROOT/install/deb/nginx/hestia-rate-limit.conf;
+	include $REPO_ROOT/install/deb/nginx/hestia-wp-auth-rate-limit.conf;
+	include $out;
+}
+EOF
+		if nginx -t -c "$WORKDIR/cov-master.conf" > "$WORKDIR/cov-nginx-t.log" 2>&1; then
+			ok "nginx -t: $base.$ext renders with valid syntax"
+		else
+			bad "nginx -t failed for $base.$ext"
+			cat "$WORKDIR/cov-nginx-t.log"
+			COVERAGE_OK=0
+		fi
+	done
+done
+[[ "$COVERAGE_OK" -eq 1 ]] && ok "all 12 WordPress template variants render and pass nginx -t"
+
 cat > "$WORKDIR/master.conf" << EOF
 daemon off;
 worker_processes 1;
@@ -171,6 +248,7 @@ http {
 	}
 	include $REPO_ROOT/install/deb/nginx/0rtt-anti-replay.conf;
 	include $REPO_ROOT/install/deb/nginx/hestia-rate-limit.conf;
+	include $REPO_ROOT/install/deb/nginx/hestia-wp-auth-rate-limit.conf;
 	include $WORKDIR/rendered.conf;
 	include $WORKDIR/rendered.ssl.conf;
 }
@@ -269,6 +347,14 @@ if kill -0 "$NGINX_PID" 2> /dev/null; then
 	check_blocked "/wp-content/debug.log"
 	check_blocked "/wp-content/uploads/evil.php"
 	check_blocked "/wp-content/cache/evil.php"
+	# Sprint 9A additions: backup/editor-leftover variants of wp-config.php
+	# and root-level SQL dump files.
+	check_blocked "/wp-config.php.bak"
+	check_blocked "/wp-config.php.save"
+	check_blocked "/wp-config.php.old"
+	check_blocked "/wp-config.php~"
+	check_blocked "/backup.sql"
+	check_blocked "/dump.sql.gz"
 
 	check_reaches_php "/index.php"
 	check_reaches_php "/wp-admin/admin-ajax.php"
@@ -280,7 +366,34 @@ if kill -0 "$NGINX_PID" 2> /dev/null; then
 	# to behave the same just because .tpl was proven correct.
 	check_blocked_ssl "/wp-config.php"
 	check_blocked_ssl "/wp-content/uploads/evil.php"
+	check_blocked_ssl "/wp-config.php.bak"
+	check_blocked_ssl "/backup.sql"
 	check_reaches_php_ssl "/index.php"
+
+	# --- Sprint 9A: WordPress auth-endpoint rate limiting. wp-login.php
+	# must throttle to 503 once its burst is exhausted; unrelated paths
+	# (mapped to an empty zone key) must never be throttled regardless of
+	# request volume. Uses HTTP/1.0-style sequential requests (not
+	# parallel) so timing is deterministic.
+	RL_LOGIN_STATUSES=""
+	for _ in $(seq 1 25); do
+		RL_LOGIN_STATUSES="$RL_LOGIN_STATUSES $(http_code /wp-login.php)"
+	done
+	if echo "$RL_LOGIN_STATUSES" | grep -q 503; then
+		ok "rate limit engages on /wp-login.php after burst exhausted (Sprint 9A)"
+	else
+		bad "rate limit never engaged on /wp-login.php after 25 rapid requests — statuses:$RL_LOGIN_STATUSES"
+	fi
+
+	RL_INDEX_STATUSES=""
+	for _ in $(seq 1 25); do
+		RL_INDEX_STATUSES="$RL_INDEX_STATUSES $(http_code /index.php)"
+	done
+	if echo "$RL_INDEX_STATUSES" | grep -q 503; then
+		bad "unrelated path /index.php was rate-limited — map-based key scoping is broken: $RL_INDEX_STATUSES"
+	else
+		ok "unrelated path /index.php never rate-limited regardless of request volume (Sprint 9A)"
+	fi
 
 	nginx -c "$WORKDIR/master.conf" -s stop 2> /dev/null
 	wait "$NGINX_PID" 2> /dev/null
@@ -308,6 +421,135 @@ else
 	echo "[SKIP] could not start nginx for feature-enabled check"
 fi
 rm -f "$DOMD"/nginx.features.conf_*
+
+# --- 10. Sprint 9A: wordpress-disable-xmlrpc — /xmlrpc.php must be blocked
+# regardless of whether its `location = /xmlrpc.php` is nested inside
+# location / (the .tpl) or a server-level sibling of it (the .stpl) — a
+# pre-existing inconsistency between the two files that was flagged for
+# verification rather than assumed safe, given Sprint 8's precedent that a
+# server-level regex location can lose to a nested regex matching the same
+# URI. Exact-match (`=`) locations are a different code path in nginx and
+# were empirically confirmed immune to that specific pitfall.
+XMLD="$WORKDIR/home/testuser/conf/web/xmlrpc.test"
+mkdir -p "$XMLD"
+render_template "$TPLDIR/wordpress-disable-xmlrpc.tpl" "$WORKDIR/xmlrpc.conf"
+render_template "$TPLDIR/wordpress-disable-xmlrpc.stpl" "$WORKDIR/xmlrpc.ssl.conf"
+sed -i \
+	-e "s|^\tlisten      127.0.0.1:18080;|\tlisten      unix:$WORKDIR/xmlrpc-http.sock;|" \
+	-e "s|%domain_idn%|xmlrpc.test|g" -e "s|%domain%|xmlrpc.test|g" \
+	"$WORKDIR/xmlrpc.conf"
+sed -i \
+	-e "s|^\tlisten      127.0.0.1:18443 ssl;|\tlisten      unix:$WORKDIR/xmlrpc-https.sock ssl;|" \
+	-e "s|%domain_idn%|xmlrpc.test|g" -e "s|%domain%|xmlrpc.test|g" \
+	"$WORKDIR/xmlrpc.ssl.conf"
+
+cat > "$WORKDIR/xmlrpc-master.conf" << EOF
+daemon off;
+worker_processes 1;
+error_log stderr;
+pid $WORKDIR/xmlrpc-nginx.pid;
+events { worker_connections 32; }
+http {
+	include /etc/nginx/mime.types;
+	default_type application/octet-stream;
+	access_log off;
+	log_format main '\$remote_addr - \$remote_user [\$time_local] \$request "\$status"';
+	log_format bytes '\$body_bytes_sent';
+	fastcgi_cache_path $WORKDIR/cache/micro-xmlrpc levels=1:2 keys_zone=microcache_xmlrpc:10m inactive=30m max_size=1024m;
+	map \$http_cookie \$no_cache { default 0; }
+	include $REPO_ROOT/install/deb/nginx/0rtt-anti-replay.conf;
+	include $REPO_ROOT/install/deb/nginx/hestia-rate-limit.conf;
+	include $REPO_ROOT/install/deb/nginx/hestia-wp-auth-rate-limit.conf;
+	include $WORKDIR/xmlrpc.conf;
+	include $WORKDIR/xmlrpc.ssl.conf;
+}
+EOF
+
+nginx -c "$WORKDIR/xmlrpc-master.conf" > /dev/null 2>&1 &
+NGINX_PID=$!
+sleep 1
+if kill -0 "$NGINX_PID" 2> /dev/null; then
+	code="$(curl -s --unix-socket "$WORKDIR/xmlrpc-http.sock" -o /dev/null -w "%{http_code}" "http://localhost/xmlrpc.php" 2> /dev/null)"
+	if [[ "$code" == "403" ]]; then
+		ok "wordpress-disable-xmlrpc.tpl: /xmlrpc.php blocked (nested exact-match location, 403)"
+	else
+		bad "wordpress-disable-xmlrpc.tpl: expected 403 for /xmlrpc.php, got $code — possible bypass"
+	fi
+	code_ssl="$(curl -s -k --unix-socket "$WORKDIR/xmlrpc-https.sock" -o /dev/null -w "%{http_code}" "https://localhost/xmlrpc.php" 2> /dev/null)"
+	if [[ "$code_ssl" == "403" ]]; then
+		ok "wordpress-disable-xmlrpc.stpl: /xmlrpc.php blocked (server-level sibling exact-match location, 403)"
+	elif [[ "$code_ssl" == "307" || "$code_ssl" == "425" ]]; then
+		echo "[SKIP] SSL anti-replay guard intercepted /xmlrpc.php (code $code_ssl) — inconclusive"
+	else
+		bad "wordpress-disable-xmlrpc.stpl: expected 403 for /xmlrpc.php, got $code_ssl — possible bypass"
+	fi
+	nginx -c "$WORKDIR/xmlrpc-master.conf" -s stop 2> /dev/null
+	wait "$NGINX_PID" 2> /dev/null
+	NGINX_PID=""
+else
+	echo "[SKIP] could not start nginx for xmlrpc precedence check"
+fi
+
+# --- 11. Sprint 9A: wordpress_mu_subdir — a planted PHP file under a
+# multisite subsite's wp-content/uploads must still be denied even though
+# the site-rewrite only fires for paths that do NOT already exist on disk
+# (`if (!-e $request_filename)`) — an attacker-planted file always exists,
+# so the rewrite never runs and the request is served by whichever
+# location matches the raw, un-rewritten /site2/wp-content/uploads/... URI
+# directly. This regresses with an anchor that only matches ^/wp-content/,
+# which is why the mu_subdir variant uses a pattern with an optional
+# leading site-segment instead.
+MUD="$WORKDIR/home/testuser/conf/web/mu.test"
+mkdir -p "$MUD" "$WORKDIR/webroot/site2/wp-content/uploads"
+touch "$WORKDIR/webroot/site2/wp-content/uploads/evil.php"
+render_template "$TPLDIR/wordpress_mu_subdir.tpl" "$WORKDIR/mu.conf"
+sed -i \
+	-e "s|^\tlisten      127.0.0.1:18080;|\tlisten      unix:$WORKDIR/mu-http.sock;|" \
+	-e "s|%domain_idn%|mu.test|g" -e "s|%domain%|mu.test|g" \
+	"$WORKDIR/mu.conf"
+
+cat > "$WORKDIR/mu-master.conf" << EOF
+daemon off;
+worker_processes 1;
+error_log stderr;
+pid $WORKDIR/mu-nginx.pid;
+events { worker_connections 32; }
+http {
+	include /etc/nginx/mime.types;
+	default_type application/octet-stream;
+	access_log off;
+	log_format main '\$remote_addr - \$remote_user [\$time_local] \$request "\$status"';
+	log_format bytes '\$body_bytes_sent';
+	fastcgi_cache_path $WORKDIR/cache/micro-mu levels=1:2 keys_zone=microcache_mu:10m inactive=30m max_size=1024m;
+	map \$http_cookie \$no_cache { default 0; }
+	include $REPO_ROOT/install/deb/nginx/hestia-rate-limit.conf;
+	include $REPO_ROOT/install/deb/nginx/hestia-wp-auth-rate-limit.conf;
+	include $WORKDIR/mu.conf;
+}
+EOF
+
+nginx -c "$WORKDIR/mu-master.conf" > /dev/null 2>&1 &
+NGINX_PID=$!
+sleep 1
+if kill -0 "$NGINX_PID" 2> /dev/null; then
+	code="$(curl -s --unix-socket "$WORKDIR/mu-http.sock" -o /dev/null -w "%{http_code}" "http://localhost/wp-content/uploads/evil.php" 2> /dev/null)"
+	if [[ "$code" == "404" ]]; then
+		ok "wordpress_mu_subdir.tpl: root-site /wp-content/uploads/evil.php blocked"
+	else
+		bad "wordpress_mu_subdir.tpl: expected 404 for root-site uploads PHP, got $code"
+	fi
+	code_sub="$(curl -s --unix-socket "$WORKDIR/mu-http.sock" -o /dev/null -w "%{http_code}" "http://localhost/site2/wp-content/uploads/evil.php" 2> /dev/null)"
+	if [[ "$code_sub" == "404" ]]; then
+		ok "wordpress_mu_subdir.tpl: subsite /site2/wp-content/uploads/evil.php blocked (regression check)"
+	else
+		bad "wordpress_mu_subdir.tpl: expected 404 for subsite uploads PHP, got $code_sub — multisite bypass"
+	fi
+	nginx -c "$WORKDIR/mu-master.conf" -s stop 2> /dev/null
+	wait "$NGINX_PID" 2> /dev/null
+	NGINX_PID=""
+else
+	echo "[SKIP] could not start nginx for mu_subdir regression check"
+fi
 
 echo "=== Summary: $PASS passed, $FAIL failed ==="
 [[ "$FAIL" -eq 0 ]]
